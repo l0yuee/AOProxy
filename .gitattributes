@@ -1,0 +1,18 @@
+# 仓库里的文本一律以 LF 入库、以 LF 检出。
+#
+# 不这么写的话，Windows 上 git 默认 core.autocrlf=true，克隆时会把工作区的 LF
+# 换成 CRLF。third_party/qt 里那七千多个头文件、.prl、qmldir 首当其冲，克隆完
+# 一次 git status 就是满屏的假改动。core.autocrlf 只存在 .git/config 里、不随
+# 仓库分发，所以规则得写在这里才对所有人生效。
+* text=auto eol=lf
+
+# 二进制：不做行尾转换，也不要在 diff 里展开成文本。
+*.png   binary
+*.ico   binary
+*.jpg   binary
+*.qm    binary
+*.dll   binary
+*.lib   binary
+*.exe   binary
+*.pdb   binary
+*.bin   binary
