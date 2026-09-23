@@ -1,0 +1,30 @@
+# 注意：third_party/qt 是随项目分发的 Qt，GUI 构建离不开它，必须纳入版本库。
+# 不要在这里添加 *.dll、*.lib、*.exe 之类的通配：它们会把其中的文件一并排除。
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# 构建期由 crates/gui/build.rs 从 assets/icons/ 拷来的托盘图标，不是源文件
+crates/gui/qml/icons/
+
+# Python 辅助脚本（tools/gen-icons.py）的副产物
+__pycache__/
+*.py[cod]
+
+# Editor / IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Secrets / local overrides
+.env
+.env.*
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store

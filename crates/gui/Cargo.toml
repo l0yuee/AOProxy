@@ -1,0 +1,32 @@
+[package]
+name = "aoproxy-gui"
+description = "AOProxy desktop GUI — Qt 6 via cxx-qt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "aoproxy-gui"
+path = "src/main.rs"
+# 本 crate 只是 QML 与 core 之间的桥接层，逻辑与测试都在 aoproxy-core。
+# 关掉测试目标，否则 cargo test 会链出一个需要 Qt DLL 的空测试程序，
+# 在未部署 Qt 的 target/debug 下以 STATUS_DLL_NOT_FOUND 退出。
+test = false
+
+[dependencies]
+aoproxy-core.workspace = true
+cxx.workspace = true
+cxx-qt.workspace = true
+cxx-qt-lib.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+# 规则与设置表单在 QML 与 Rust 之间以 JSON 传递：QML 原生有 JSON.stringify，
+# 而 cxx-qt 无法直接跨界传 Rust 结构体。
+serde_json.workspace = true
+
+[build-dependencies]
+cxx-qt-build.workspace = true

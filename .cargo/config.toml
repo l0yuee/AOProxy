@@ -1,0 +1,22 @@
+# 构建配置。
+#
+# GUI 依赖的 Qt 6（6.8.3，MSVC 2022 x64）随项目放在 third_party/qt。
+# cxx-qt 的构建脚本靠 QMAKE 定位 Qt，这里用 relative = true 按项目根解析，
+# 整个项目拷到别的目录或别的机器上都能直接编译。
+#
+# 这一项不能省：不指定 QMAKE 时会取 PATH 上第一个 qmake，那可能是某个 Qt 5，
+# 构建会以 moc 报错失败。
+#
+# 值不带 force，外部已设置的 QMAKE 优先。
+#
+# 在 Linux / macOS 上构建 GUI 时必须用它指向系统 Qt 6 的 qmake，否则这里的默认值会让
+# cxx-qt 去执行一个 Windows 的 .exe，报 QMakeSetQtMissing / PermissionDenied：
+#
+#     QMAKE=$(command -v qmake6) cargo build --release -p aoproxy-gui
+#
+# 只构建 CLI（`cargo build --release -p aoproxy`）用不到 Qt，无需理会；但 `-p` 不能省，
+# 省掉会连 GUI 一起构建，于是同样撞上这个报错。
+#
+# cargo 的 [env] 不支持按平台区分，所以这个默认值在非 Windows 上只能由外部覆盖。
+[env]
+QMAKE = { value = "third_party/qt/bin/qmake.exe", relative = true }

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AOProxy 图标矢量源。
+
+  几何取值与 tools/gen-icons.py 中的 GEOM 表一一对应（单位：128 = 1.0），
+  改动此文件后请同步改脚本并重新生成位图，否则两者会不一致。
+
+    margin 0.055 → 7      radius 0.215 → 27.5
+    shaft  0.105 → 13.44  head_w 0.150 → 19.2   head_h 0.225 → 28.8
+    gap    0.085 → 10.88  inset  0.185 → 23.68
+
+  两条反向箭头构成"中继/转发"意象；主色为青到蓝的对角渐变。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2FB8C6"/>
+      <stop offset="1" stop-color="#3B6FE0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角方形底 -->
+  <rect x="7" y="7" width="114" height="114" rx="27.5" ry="27.5" fill="url(#g)"/>
+
+  <!-- 上行箭头：向右 -->
+  <path fill="#FFFFFF" d="
+    M 23.68 45.28
+    L 85.12 45.28
+    L 85.12 34.72
+    L 104.32 49.6
+    L 85.12 64.48
+    L 85.12 53.92
+    L 23.68 53.92
+    Z"/>
+
+  <!-- 下行箭头：向左 -->
+  <path fill="#FFFFFF" d="
+    M 104.32 74.08
+    L 42.88 74.08
+    L 42.88 63.52
+    L 23.68 78.4
+    L 42.88 93.28
+    L 42.88 82.72
+    L 104.32 82.72
+    Z"/>
+</svg>

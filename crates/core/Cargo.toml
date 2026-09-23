@@ -1,0 +1,45 @@
+[package]
+name = "aoproxy-core"
+description = "Proxy engine for AOProxy: forward/reverse HTTP and SOCKS5 relaying for AI API traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+
+tokio-socks.workspace = true
+
+rustls.workspace = true
+tokio-rustls.workspace = true
+hyper-rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+
+serde.workspace = true
+toml.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+directories.workspace = true
+base64.workspace = true
+parking_lot.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
