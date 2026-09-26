@@ -1,9 +1,13 @@
 // 规则编辑对话框。新建与修改是同一条路径：`ruleJson("")` 给模板，
 // `ruleJson(id)` 给现有规则，表单只负责把 JSON 铺进控件、再拼回 JSON。
 //
-// 字段可见性跟着模式与认证方式走：正向模式没有目标地址也没有 TLS，
-// 路径令牌只在反向模式下成立。这些规则与 core 的 `Rule::validate` 对齐——
-// 界面先挡一道给即时反馈，核心再挡一道保证落盘的东西一定合法。
+// 字段可见性跟着模式与认证方式走：正向模式没有目标地址，路径令牌只在反向
+// 模式下成立。入站 TLS 两种模式都有：正向模式配上 TLS 就是 HTTPS 代理，
+// 公网网关正是这么用的（见 README 的服务器示例）。
+//
+// 校验分两道：界面先查几项能当场说清楚的（端口没填、证书只给了一半），
+// 再经 bridge.checkRule 跑核心的完整校验——与保存时引擎做的是同一套，
+// 只是提前到对话框关闭之前，错误就显示在对话框里。
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
@@ -13,6 +17,7 @@ Dialog {
 
     property var bridge: null
     /// 空串表示新建。非空时 ID 不可改，免得改完变成新增一条、旧的还留着。
+    /// 新建时 ID 不得与已有规则重复，否则按 ID 覆盖会把那条规则悄悄换掉。
     property string editingId: ""
     /// 界面侧校验的结果，存不下去时显示在页脚。
     property string localError: ""
@@ -102,16 +107,17 @@ Dialog {
         } else if (authKind === "token" && tokenField.text !== "") {
             r.auth.token = tokenField.text
         }
-        if (reverse && (certField.text.trim() !== "" || keyField.text.trim() !== ""))
+        if (certField.text.trim() !== "" || keyField.text.trim() !== "")
             r.tls = { cert: certField.text.trim(), key: keyField.text.trim() }
         return r
     }
 
-    /// 界面侧校验，返回空串表示可以存。最后一步 verifyTls 要读盘解析密钥，
-    /// 走的是 `aoproxy config check` 用的同一个函数，两处结论不会不一致。
+    /// 保存前校验，返回空串表示可以存。前面几项是界面能当场说清楚的；最后交给
+    /// checkRule 跑核心的完整校验（ID 字符集与是否重复、端口冲突、证书与私钥是否
+    /// 配对……），与 `aoproxy config check` 结论一致。ID 的字符集只在核心那边查：
+    /// 那里认 Unicode 字母，界面若只认 ASCII，配置文件里的中文 ID 规则就改不了了。
     function checkLocal(r) {
         if (r.id === "") return t("valid.id_empty")
-        if (!/^[A-Za-z0-9_-]+$/.test(r.id)) return t("valid.id_charset")
         if (hostField.text.trim() === "" || !/^[0-9]+$/.test(portField.text.trim()))
             return t("valid.listen_invalid")
         if (reverse) {
@@ -131,8 +137,7 @@ Dialog {
         }
         if (r.tls && (r.tls.cert === "" || r.tls.key === ""))
             return t("valid.tls_incomplete")
-        if (r.tls) return bridge.verifyTls(r.tls.cert, r.tls.key)
-        return ""
+        return bridge.checkRule(JSON.stringify(r), editingId === "")
     }
 
     function submit() {
@@ -144,7 +149,7 @@ Dialog {
         }
         localError = ""
         bridge.clearError()
-        bridge.saveRule(JSON.stringify(r))
+        bridge.saveRule(JSON.stringify(r), editingId === "")
         saved()
         close()
     }
@@ -380,10 +385,10 @@ Dialog {
                 }
             }
 
-            // TLS 只对反向模式成立：正向模式下我们是代理而非服务端，
-            // 证书没有用处，字段整段隐藏而不是禁用，省得让人琢磨为什么填不了。
+            // 入站 TLS，两种模式都适用：反向模式是 HTTPS 服务端，正向模式是 HTTPS 代理。
+            // 早先这一段只在反向模式下显示，收集时也只收反向模式的——结果是在界面上
+            // 随便改一下正向规则（比如只改个名字），配置文件里的 TLS 就被悄悄删掉了。
             Text {
-                visible: root.reverse
                 text: root.t("gui.tls_section")
                 // 分节标题，用正文色加粗；muted 小字在这里会被当成脚注忽略掉。
                 color: theme.body
@@ -394,7 +399,6 @@ Dialog {
             }
 
             Rectangle {
-                visible: root.reverse
                 implicitHeight: 1
                 color: theme.border
                 Layout.fillWidth: true
@@ -404,7 +408,6 @@ Dialog {
             FieldRow {
                 label: root.t("gui.tls_cert")
                 hint: root.t("gui.optional")
-                visible: root.reverse
                 Layout.fillWidth: true
                 LineInput {
                     id: certField
@@ -415,7 +418,6 @@ Dialog {
 
             FieldRow {
                 label: root.t("gui.tls_key")
-                visible: root.reverse
                 Layout.fillWidth: true
                 LineInput {
                     id: keyField

@@ -27,7 +27,7 @@ SystemTrayIcon {
     readonly property int runningCount: bridge ? bridge.runningCount : 0
 
     // Linux 上没有托盘协议时 available 为 false，此时不显示，
-    // 由主窗口按 trayAvailable 提示一次「关闭窗口只会最小化」。
+    // 由主窗口按 trayAvailable 提示一次「关闭窗口即退出」。
     visible: available
 
     icon.source: runningCount > 0

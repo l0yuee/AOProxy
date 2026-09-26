@@ -84,11 +84,13 @@ Could not find Qt installation: QMakeSetQtMissing {
 ```bash
 sudo apt install qt6-base-dev qt6-declarative-dev lld \
                  qml6-module-qtquick-controls qml6-module-qtquick-layouts \
-                 qml6-module-qtqml-workerscript qml6-module-qt-labs-platform
+                 qml6-module-qtqml-workerscript qml6-module-qt-labs-platform \
+                 qml6-module-qtquick-dialogs
 ```
 
 `lld` 是必需的：cxx-qt 的构建脚本在 Linux 上会发 `-fuse-ld=lld`，没装会在链接阶段失败。
 `qml6-module-qt-labs-platform` 只影响托盘——缺了它界面照常启动，只是没有托盘图标。
+`qml6-module-qtquick-dialogs` 只影响设置页选择配置文件的「浏览…」按钮，缺了它照样能手填路径。
 
 再用 `QMAKE` 指向系统的 qmake（外部设置的值优先于 `.cargo/config.toml`，无需改仓库里的文件）：
 
@@ -133,6 +135,9 @@ PowerShell 中写作 `$env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:8080'`。
 | Linux | `~/.config/aoproxy/config.toml`（设置了 `XDG_CONFIG_HOME` 时位于其下） |
 | macOS | `~/Library/Application Support/AOProxy/config.toml` |
 
+配置文件也可以放在别处：在 GUI 的设置页换一个文件，这个位置会记在默认路径旁边的 `location.toml` 里，
+此后 GUI 与 CLI 都用它；删掉 `location.toml` 就回到默认位置。命令行的 `-c` 优先于这一切，只作用于那一次运行。
+
 ### 命令行
 
 `aoproxy` 不带子命令时等同于 `aoproxy run`。
@@ -140,7 +145,7 @@ PowerShell 中写作 `$env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:8080'`。
 ```
 aoproxy run [选项]
 
-  -c, --config <FILE>       配置文件路径（省略时使用平台默认位置）
+  -c, --config <FILE>       配置文件路径（省略时用 GUI 设置页选定的位置，没选过则为平台默认位置）
   -r, --rule <ID>           只启动指定规则（可重复；省略时启动全部已启用规则）
       --log-level <LEVEL>   日志级别 error | warn | info | debug | trace（默认 info）
   -q, --quiet               静默模式，不输出任何日志
@@ -180,19 +185,37 @@ aoproxy run --listen 127.0.0.1:8080 --mode reverse --target https://api.anthropi
 
 以上命令都可用 `-c <FILE>` 指定其他配置文件。
 
+`aoproxy run` 在配置文件不存在、或一条规则都没能启动（没有启用的规则、端口全被占用……）时报错退出，
+退出码为 1，而不是守着一个什么都没在监听的进程——在 systemd 下这样 `Restart=on-failure` 才能起作用。
+部分规则启动失败时，其余的照常运行。
+
 ### 图形界面
 
 运行部署好的 `aoproxy-gui.exe`。它与 CLI 读写同一份配置文件，改动即时保存，没有「保存」按钮。
 
 - **规则**：每条规则一张卡片，显示运行状态、监听地址、模式、流量与连接数；鼠标悬停时可编辑或删除。
-  顶栏有「新建」「全部启用」「全部停止」。规则的「启用」开关只决定它会不会被「全部启用」一并启动。
+  顶栏有「新建」「全部启用」「全部停止」。规则的「启用」开关打开即启动该规则、关上即停止，
+  并决定它会不会被「全部启用」与开机自启一并启动；卡片上的「启动」「停止」只管这一次，不改开关。
 - **日志**：运行日志。默认关闭，在设置页打开。
-- **设置**：界面语言（即时切换）、日志开关与级别、关闭窗口时是否最小化到托盘，以及配置文件路径。
+- **设置**：
+  - 界面语言（即时切换，下次启动沿用）、日志开关与级别、关闭窗口时是否最小化到托盘。
+  - **登录系统后自动启动**：开机后程序缩在托盘里启动，并运行全部已启用的规则。登记在系统自己的自启位置：
+    Windows 是注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 是
+    `~/.config/autostart/aoproxy.desktop`，macOS 是 `~/Library/LaunchAgents/com.aoproxy.gui.plist`。
+    开关显示的是系统里实际登记的状态：在任务管理器或桌面环境里关掉自启，这里也会跟着变。
+    程序挪了位置后要重新打开一次。
+  - **配置文件**：填另一个文件的完整路径后点「应用」（或点「浏览…」选择）。文件已存在就载入它；
+    不存在就把当前配置存过去。定义没变的规则不会被打断，其余正在运行的规则会先停下。
+    「恢复默认」回到平台默认位置。启动时配置文件读不出来（比如格式写错了），顶部会显示原因，
+    在外面改好后回到这里点「应用」即可重新载入，不必重启。
 
 托盘图标在有规则运行时为彩色、全部停止时为灰色；单击或双击唤回窗口，右键菜单可显示主窗口、全部启用、
 全部停止或退出。系统托盘不可用时，关闭窗口即退出。退出时若仍有规则在运行会先确认，确认后停止全部规则再退出。
 
 程序只运行一个实例：再次启动会把已打开的窗口唤到前台。
+
+`aoproxy-gui` 也接受两个命令行参数：`-c <FILE>`（本次运行用这个配置文件，不改设置页记下的位置）与
+`--autostart`（开机自启时由系统带上：缩在托盘里启动，并运行已启用的规则）。
 
 ### 配置示例
 

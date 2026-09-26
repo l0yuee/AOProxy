@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use parking_lot::Mutex;
@@ -17,7 +18,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use aoproxy_core::engine::listener;
-use aoproxy_core::{AuthConfig, AuthKind, Mode, Rule, Stats, Upstream};
+use aoproxy_core::status::StatsSnapshot;
+use aoproxy_core::{AuthConfig, AuthKind, Mode, Rule, Stats, Upstream, UpstreamKind};
 
 // ─────────────── 测试替身 ───────────────
 
@@ -27,6 +29,16 @@ type Recorded = Arc<Mutex<Vec<String>>>;
 /// 一个只会回固定 200 的上游：把每条请求的头部整段记下来供断言。
 async fn spawn_origin() -> (SocketAddr, Recorded) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind origin");
+    serve_origin(listener)
+}
+
+/// 同 [`spawn_origin`]，但监听在 IPv6 回环上。本机没有 IPv6 时返回 `None`，用例据此跳过。
+async fn spawn_origin_v6() -> Option<(SocketAddr, Recorded)> {
+    let listener = TcpListener::bind(("::1", 0)).await.ok()?;
+    Some(serve_origin(listener))
+}
+
+fn serve_origin(listener: TcpListener) -> (SocketAddr, Recorded) {
     let addr = listener.local_addr().expect("origin addr");
     let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&recorded);
@@ -69,6 +81,64 @@ async fn spawn_echo() -> SocketAddr {
     });
 
     addr
+}
+
+/// 一个假的上游 HTTP 代理：读完 CONNECT 请求头就回 200，并把 `greeting` 与应答放在
+/// 同一次写里发出——模拟服务端先说话的协议（SSH、SMTP）在隧道建好的瞬间就送来数据。
+/// 之后原样回显。收到的请求头记下来供断言。
+async fn spawn_http_upstream(greeting: &'static [u8]) -> (SocketAddr, Recorded) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut stream).await else {
+                    return;
+                };
+                sink.lock().push(head);
+                let mut reply = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
+                reply.extend_from_slice(greeting);
+                if stream.write_all(&reply).await.is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    (addr, recorded)
+}
+
+fn http_upstream(addr: SocketAddr) -> Upstream {
+    Upstream {
+        kind: UpstreamKind::Http,
+        address: Some(addr.to_string()),
+        username: None,
+        password: None,
+    }
+}
+
+/// 等到所有连接都结算完毕，返回那时的统计。
+///
+/// 连接关闭后的结算发生在处理任务里，与测试任务并发，不能关完立刻去读。
+async fn settled(stats: &Stats) -> StatsSnapshot {
+    for _ in 0..100 {
+        let snap = stats.snapshot();
+        if snap.active == 0 {
+            return snap;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("连接迟迟没有结算：{:?}", stats.snapshot());
 }
 
 /// 读到空行为止，返回请求头（或响应头）原文。逐字节读，测试里够用。
@@ -538,5 +608,134 @@ async fn cancel_stops_accepting_new_connections() {
     panic!("取消后端口仍在接受连接");
 }
 
+/// 连上之后一个字节都不发的连接，握手时限一到就被关掉，不能一直占着文件描述符。
+///
+/// 时钟是暂停的：运行时一空闲就直接快进到最近的定时器，不必真等上一分钟。
+#[tokio::test(start_paused = true)]
+async fn silent_connection_is_closed_after_handshake_timeout() {
+    let mut rule = base_rule(Mode::Reverse);
+    rule.target = Some("http://127.0.0.1:1".to_owned());
+    let (proxy, stats, cancel) = start(rule).await;
 
+    let mut s = TcpStream::connect(proxy).await.expect("connect proxy");
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(600), s.read(&mut buf))
+        .await
+        .expect("一声不吭的连接一直没被关掉");
+    // 服务端关闭后读到 EOF；个别平台上是连接被重置，同样说明它被关掉了。
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert_eq!(settled(&stats).await.active, 0);
 
+    cancel.cancel();
+}
+
+// ─────────────── 统计 ───────────────
+
+/// CONNECT 隧道开着的时候这条连接算活跃，隧道里的字节计入流量——客户端以 RST
+/// 粗暴断开时也一样。
+///
+/// 隧道是 hyper 升级出来的：统计若在升级那一刻就结算，隧道还在传数据，活跃数已经
+/// 归零；而 `copy_bidirectional` 出错时不给部分计数，被重置的隧道流量会整段丢失。
+#[tokio::test]
+async fn forward_connect_tunnel_is_active_and_counted_until_closed() {
+    let echo = spawn_echo().await;
+    let (proxy, stats, cancel) = start(base_rule(Mode::Forward)).await;
+
+    let mut s = TcpStream::connect(proxy).await.expect("connect proxy");
+    s.write_all(format!("CONNECT {echo} HTTP/1.1\r\nhost: {echo}\r\n\r\n").as_bytes())
+        .await
+        .expect("write CONNECT");
+    let head = read_head(&mut s).await.expect("read CONNECT response");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let payload = [0x5au8; 4096];
+    s.write_all(&payload).await.expect("write tunnel");
+    let mut back = vec![0u8; payload.len()];
+    s.read_exact(&mut back).await.expect("read tunnel");
+    assert_eq!(stats.snapshot().active, 1, "隧道还开着，连接却已不算活跃");
+
+    // linger 置 0 再关：内核发 RST 而不是 FIN。
+    s.set_zero_linger().expect("set linger");
+    drop(s);
+
+    let snap = settled(&stats).await;
+    let n = payload.len() as u64;
+    assert!(snap.bytes_up >= n, "上行只记了 {} 字节，隧道里送了 {n}", snap.bytes_up);
+    assert!(snap.bytes_down >= n, "下行只记了 {} 字节，隧道里回了 {n}", snap.bytes_down);
+
+    cancel.cancel();
+}
+
+// ─────────────── 上游：HTTP CONNECT ───────────────
+
+/// 上游把 200 应答和隧道里的首批数据放在同一个包里发来时，那批数据不能在读应答头
+/// 的时候被一起吞掉。
+#[tokio::test]
+async fn http_upstream_keeps_bytes_sent_along_with_connect_reply() {
+    let (upstream, _recorded) = spawn_http_upstream(b"HELLO").await;
+    let mut rule = base_rule(Mode::Forward);
+    rule.upstream = http_upstream(upstream);
+    let (proxy, _stats, cancel) = start(rule).await;
+
+    let mut s = TcpStream::connect(proxy).await.expect("connect proxy");
+    s.write_all(b"CONNECT example.com:22 HTTP/1.1\r\nhost: example.com:22\r\n\r\n")
+        .await
+        .expect("write CONNECT");
+    let head = read_head(&mut s).await.expect("read CONNECT response");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut greeting = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut greeting))
+        .await
+        .expect("上游随应答一起发来的数据丢了")
+        .expect("read tunnel");
+    assert_eq!(&greeting, b"HELLO");
+
+    cancel.cancel();
+}
+
+/// IPv6 字面量目标经 HTTP 上游转发时，CONNECT 请求行与 Host 里的地址必须带方括号，
+/// 否则 `::1:443` 这种写法上游无从分辨哪段是端口。
+#[tokio::test]
+async fn http_upstream_brackets_ipv6_connect_target() {
+    let (upstream, recorded) = spawn_http_upstream(b"").await;
+    let mut rule = base_rule(Mode::Forward);
+    rule.upstream = http_upstream(upstream);
+    let (proxy, _stats, cancel) = start(rule).await;
+
+    let mut s = TcpStream::connect(proxy).await.expect("connect proxy");
+    s.write_all(b"CONNECT [::1]:443 HTTP/1.1\r\nhost: [::1]:443\r\n\r\n")
+        .await
+        .expect("write CONNECT");
+    let head = read_head(&mut s).await.expect("read CONNECT response");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let sent = first_head(&recorded);
+    assert!(sent.starts_with("connect [::1]:443 http/1.1\r\n"), "{sent}");
+    assert!(sent.contains("\r\nhost: [::1]:443\r\n"), "{sent}");
+
+    cancel.cancel();
+}
+
+// ─────────────── 正向代理：IPv6 ───────────────
+
+/// 绝对形式请求的目标是 IPv6 字面量时，`http://[::1]:port/` 里的方括号只属于 URL 语法，
+/// 拨号用的主机名得去掉它们。
+#[tokio::test]
+async fn forward_absolute_form_reaches_ipv6_origin() {
+    let Some((origin, recorded)) = spawn_origin_v6().await else {
+        eprintln!("本机没有 IPv6 回环，跳过");
+        return;
+    };
+    let (proxy, _stats, cancel) = start(base_rule(Mode::Forward)).await;
+
+    let resp = round_trip(
+        proxy,
+        &format!("GET http://{origin}/v1/models HTTP/1.1\r\nhost: {origin}\r\nconnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(first_head(&recorded).contains(&format!("host: {origin}")), "{}", first_head(&recorded));
+
+    cancel.cancel();
+}

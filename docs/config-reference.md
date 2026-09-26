@@ -10,7 +10,21 @@ AOProxy 使用 TOML 格式的配置文件。本文档覆盖所有字段的类型
 | Linux | `~/.config/aoproxy/config.toml` |
 | macOS | `~/Library/Application Support/AOProxy/config.toml` |
 
-用 `aoproxy config path` 查看当前平台的实际路径，用 `aoproxy config init` 生成示例文件。
+用 `aoproxy config path` 查看实际使用的路径，用 `aoproxy config init` 生成示例文件。
+
+配置文件可以不在默认位置。GUI 设置页里换了配置文件后，新位置记在默认路径同目录的 `location.toml` 中：
+
+```toml
+config = "D:/proxy/aoproxy.toml"
+```
+
+GUI 与 CLI 按以下顺序确定用哪个文件：
+
+1. 命令行 `-c <FILE>`（只作用于这一次运行，不改 `location.toml`）；
+2. `location.toml` 里记的位置（相对路径按 `location.toml` 所在目录解析）；
+3. 上表的默认路径。
+
+删掉 `location.toml` 即回到默认位置。它写坏了会报错，而不是悄悄退回默认位置——那样改的就不是你以为的那份配置了。
 
 ---
 
@@ -47,9 +61,9 @@ minimize_to_tray = true
 即时生效并落盘。CLI 不读这一块，它的日志只由命令行决定——默认 `info` 级别、默认开启，
 用 `--log-level` 改级别、`--quiet` 关掉。`minimize_to_tray` 也只有 GUI 用得上。
 
-`language` 是其中的例外：GUI 启动时按系统环境变量（`LC_ALL`、`LC_MESSAGES`、`LANG`、`LANGUAGE`）
-取语言，这些变量为空时用 `zh-CN`——Windows 上通常如此。配置里的 `language` 要到设置页改动时
-才生效，重启后界面语言仍按上述规则重新推断。
+GUI 启动时按 `language` 设定界面语言，设置页里改了即时生效，下次启动沿用。配置文件还不存在时
+（第一次运行），界面语言按系统环境变量（`LC_ALL`、`LC_MESSAGES`、`LANG`、`LANGUAGE`）推断，
+这些变量为空时用 `zh-CN`——Windows 上通常如此；第一次保存时推断出的语言随之写进配置。
 
 `log_level` 取值：
 
@@ -194,7 +208,9 @@ key  = "/etc/ssl/private/privkey.pem"
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `cert` | 字符串 | 是 | PEM 格式证书链文件路径（含中间证书）|
-| `key` | 字符串 | 是 | PEM 格式私钥文件路径 |
+| `key` | 字符串 | 是 | PEM 格式私钥文件路径：PKCS#8（`BEGIN PRIVATE KEY`）、RSA（`BEGIN RSA PRIVATE KEY`）或 EC（`BEGIN EC PRIVATE KEY`）均可 |
+
+正向、反向两种模式都可以配入站 TLS：反向模式因此成为 HTTPS 服务端，正向模式则成为 HTTPS 代理。
 
 配置文件加载时检查文件存在性；证书与私钥的匹配性在引擎启动时验证。
 

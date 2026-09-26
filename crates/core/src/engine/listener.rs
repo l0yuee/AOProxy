@@ -10,16 +10,29 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Mode, Rule};
 use crate::engine::counter::{ByteCounters, CountingStream};
+use crate::engine::forward::PeekStream;
 use crate::engine::tls::build_acceptor;
 use crate::error::{Error, Result};
 use crate::status::Stats;
+
+/// 新连接完成握手的时限：TLS 握手、送来第一个字节、SOCKS5 协商、HTTP 请求头各自不得超过它。
+///
+/// 连上之后一声不吭的连接会一直占着一个文件描述符。公网端口上被人攒够一千来个，
+/// 进程的描述符就用完了，正常客户端再也连不进来。60 秒与 nginx 的
+/// `client_header_timeout`、`ssl_handshake_timeout` 默认值一致，正常客户端碰不到。
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// accept 因资源不足（描述符用尽、内存不足）失败后，歇多久再试。
+/// 立刻重试只会在同一个错误上空转，把 CPU 和日志一起烧掉。
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// 已绑定好的监听资源，交给 [`serve`] 运行。
 pub struct Bound {
@@ -58,6 +71,9 @@ pub async fn bind(rule: &Rule) -> Result<Bound> {
 /// 运行 accept 循环直到 `cancel` 被触发。
 ///
 /// 取消只停止接受新连接，已建立的连接各自跑完——正在传输的 SSE 不会被拦腰截断。
+///
+/// accept 出错不会结束循环（见 [`is_connection_error`]），所以目前总是返回 `Ok`；
+/// 签名里的 `Result` 留给将来真正无法恢复的错误。
 pub async fn serve(
     bound: Bound,
     rule: Rule,
@@ -91,13 +107,19 @@ pub async fn serve(
                             handle_conn(stream, peer_addr, rule, stats, tls).await;
                         });
                     }
+                    // accept 出错不能结束循环：那样规则就永久停摆了，而进程还活着，
+                    // systemd 也不会来重启它。连接在 accept 之前就被对端重置属于常态，
+                    // 直接接着 accept；其余多半是描述符用尽（EMFILE / ENFILE）这类
+                    // 资源不足，等占着的连接释放后自会恢复，歇一会儿再试。
+                    Err(e) if is_connection_error(&e) => {
+                        tracing::debug!(rule_id = %rule.id, "accept error: {e}");
+                    }
                     Err(e) => {
-                        // EMFILE / 连接在 accept 前就被重置之类：记一笔后继续。
-                        if is_transient_accept_error(&e) {
-                            tracing::warn!(rule_id = %rule.id, "accept error (transient): {e}");
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        } else {
-                            return Err(Error::Io(e));
+                        tracing::warn!(rule_id = %rule.id, "accept error, retrying in 1s: {e}");
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_BACKOFF) => {}
                         }
                     }
                 }
@@ -123,17 +145,30 @@ async fn handle_conn(
     let stream = CountingStream::new(stream, counters.clone());
 
     let result = match tls {
-        Some(acceptor) => match acceptor.accept(stream).await {
-            Ok(tls_stream) => dispatch(tls_stream, peer_addr, &rule, &stats).await,
-            Err(e) => {
-                // 端口扫描、证书不被客户端接受都会走到这里，记 debug 即可。
-                tracing::debug!(rule_id = %rule.id, "TLS handshake failed from {peer_addr}: {e}");
-                stats.error();
-                let (up, down) = counters.get();
-                stats.conn_close(up, down);
-                return;
+        Some(acceptor) => {
+            let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TLS handshake timed out",
+                    ))
+                });
+            match handshake {
+                Ok(tls_stream) => dispatch(tls_stream, peer_addr, &rule, &stats).await,
+                Err(e) => {
+                    // 端口扫描、证书不被客户端接受都会走到这里，记 debug 即可。
+                    tracing::debug!(
+                        rule_id = %rule.id,
+                        "TLS handshake failed from {peer_addr}: {e}"
+                    );
+                    stats.error();
+                    let (up, down) = counters.get();
+                    stats.conn_close(up, down);
+                    return;
+                }
             }
-        },
+        }
         None => dispatch(stream, peer_addr, &rule, &stats).await,
     };
 
@@ -147,8 +182,12 @@ async fn handle_conn(
 }
 
 /// 按规则模式分发。明文流与 TLS 解密后的流走的是同一个函数。
+///
+/// 分发前先等客户端送来第一个字节（最多 [`HANDSHAKE_TIMEOUT`]），再用 [`PeekStream`]
+/// 还回去：正向模式本来就要靠它判断协议；反向模式交给 hyper 之后，hyper 的请求头
+/// 超时只从收到第一个字节才开始计，连上后一个字节都不发的连接得在这里挡。
 async fn dispatch<S>(
-    stream: S,
+    mut stream: S,
     peer_addr: SocketAddr,
     rule: &Arc<Rule>,
     stats: &Arc<Stats>,
@@ -156,18 +195,29 @@ async fn dispatch<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut first = [0u8; 1];
+    let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read(&mut first))
+        .await
+        .map_err(|_| "client sent nothing before the handshake timeout")??;
+    if read == 0 {
+        return Ok(()); // 客户端连上就关，正常收尾
+    }
+    let stream = PeekStream::with_byte(stream, first[0]);
+
     match rule.mode {
         Mode::Forward => crate::engine::forward::handle_forward(stream, peer_addr, rule, stats).await,
         Mode::Reverse => crate::engine::reverse::handle_reverse(stream, peer_addr, rule, stats).await,
     }
 }
 
-fn is_transient_accept_error(e: &std::io::Error) -> bool {
+/// 连接在 accept 之前就已被对端放弃或重置：换下一个连接接着 accept 即可，不必退避。
+fn is_connection_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
         e.kind(),
         ErrorKind::ConnectionAborted
             | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
             | ErrorKind::Interrupted
             | ErrorKind::WouldBlock
     )

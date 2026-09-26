@@ -12,11 +12,11 @@ pub mod reverse;
 pub mod tls;
 pub mod upstream;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +51,13 @@ pub struct RuleState {
     /// 取消令牌，调用 `cancel()` 即停止该规则。
     cancel: Option<CancellationToken>,
     handle: Option<JoinHandle<()>>,
+    /// 启动代数：每次启动与每次叫停都加一。
+    ///
+    /// 启动要先绑定端口（await），监听任务退出时要回写状态，这两处都拿自己记下的
+    /// 代数与当前值核对：对不上说明这期间规则已被叫停、删除或重新启动过，手里的
+    /// 那份状态已经不归自己管。否则旧任务收尾时会把新实例的状态改成已停止、清掉
+    /// 新实例的取消令牌。
+    generation: u64,
 }
 
 impl std::fmt::Debug for RuleState {
@@ -69,6 +76,7 @@ impl RuleState {
             stats: Arc::new(Stats::new()),
             cancel: None,
             handle: None,
+            generation: 0,
         }
     }
 }
@@ -81,7 +89,11 @@ pub struct Engine {
     states: Arc<RwLock<StateMap>>,
     /// 配置文件路径。`None` 表示这份配置不来自磁盘（CLI 的临时规则、单元测试），
     /// 此时改动只存在于内存中，[`Engine::persist`] 静默跳过写盘。
-    config_path: Option<PathBuf>,
+    /// GUI 可以换用另一个配置文件（[`Engine::switch_config`]），所以带锁。
+    config_path: RwLock<Option<PathBuf>>,
+    /// 串行化写盘。两次保存若交错进行，要么后落盘的是较旧的快照，
+    /// 要么两边同时写同一个临时文件，把内容写花。
+    persist_lock: Mutex<()>,
 }
 
 impl Engine {
@@ -106,7 +118,8 @@ impl Engine {
         Self {
             config: Arc::new(RwLock::new(config)),
             states: Arc::new(RwLock::new(states)),
-            config_path,
+            config_path: RwLock::new(config_path),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -138,8 +151,8 @@ impl Engine {
                 .clone()
         };
 
-        // 检查并设置为 Starting
-        {
+        // 检查并设置为 Starting，记下这次启动的代数。
+        let generation = {
             let mut states = self.states.write();
             let state = states
                 .entry(id.to_owned())
@@ -148,7 +161,9 @@ impl Engine {
                 return Err(Error::AlreadyRunning { id: id.to_owned() });
             }
             state.status = RuleStatus::Starting;
-        }
+            state.generation += 1;
+            state.generation
+        };
 
         // 先绑定端口。端口被占用、证书读不出来这类错误必须当场返回给调用方，
         // 否则 CLI 会报"已启动"，GUI 会亮绿灯，真相只留在日志里。
@@ -156,50 +171,51 @@ impl Engine {
             Ok(b) => b,
             Err(e) => {
                 let mut states = self.states.write();
-                if let Some(state) = states.get_mut(id) {
+                if let Some(state) = states.get_mut(id).filter(|s| s.generation == generation) {
                     state.status = RuleStatus::Failed(e.to_string());
                 }
                 return Err(e);
             }
         };
 
-        let cancel = CancellationToken::new();
-        let states = Arc::clone(&self.states);
-        let rule_id = id.to_owned();
-        let cancel_clone = cancel.clone();
-
-        // 取出 stats，供任务持有
-        let stats = {
-            let states = self.states.read();
-            Arc::clone(&states[&rule_id].stats)
-        };
-
         // 状态先写成 Running 再 spawn：反过来的话，任务可能抢先结束并写入
         // Stopped/Failed，随后被这里的赋值覆盖回 Running。
-        {
+        let cancel = CancellationToken::new();
+        let stats = {
             let mut states = self.states.write();
-            if let Some(state) = states.get_mut(id) {
-                state.status = RuleStatus::Running;
-                state.cancel = Some(cancel);
+            match states.get_mut(id).filter(|s| s.generation == generation) {
+                Some(state) => {
+                    state.status = RuleStatus::Running;
+                    state.cancel = Some(cancel.clone());
+                    Arc::clone(&state.stats)
+                }
+                // 绑定端口期间规则被叫停或删掉了：这次启动作废，
+                // 端口随 `bound` 一起释放。
+                None => return Ok(()),
             }
-        }
+        };
 
+        let states = Arc::clone(&self.states);
+        let rule_id = id.to_owned();
         let handle = tokio::spawn(async move {
-            let result = listener::serve(bound, rule, stats, cancel_clone).await;
+            let result = listener::serve(bound, rule, stats, cancel).await;
+            if let Err(e) = &result {
+                tracing::error!(
+                    rule_id = %rule_id,
+                    "{}",
+                    crate::i18n::tr_args("log.rule_failed", &[("reason", &e.localized())])
+                );
+            }
 
             let mut states = states.write();
-            if let Some(state) = states.get_mut(&rule_id) {
-                match result {
-                    Ok(()) => state.status = RuleStatus::Stopped,
-                    Err(e) => {
-                        tracing::error!(
-                            rule_id = %rule_id,
-                            "{}",
-                            crate::i18n::tr_args("log.rule_failed", &[("reason", &e.to_string())])
-                        );
-                        state.status = RuleStatus::Failed(e.to_string());
-                    }
-                }
+            if let Some(state) = states
+                .get_mut(&rule_id)
+                .filter(|s| s.generation == generation)
+            {
+                state.status = match result {
+                    Ok(()) => RuleStatus::Stopped,
+                    Err(e) => RuleStatus::Failed(e.to_string()),
+                };
                 state.cancel = None;
                 state.handle = None;
             }
@@ -209,7 +225,7 @@ impl Engine {
         {
             let mut states = self.states.write();
             if let Some(state) = states.get_mut(id) {
-                if state.status == RuleStatus::Running {
+                if state.generation == generation && state.status == RuleStatus::Running {
                     state.handle = Some(handle);
                 }
             }
@@ -219,12 +235,20 @@ impl Engine {
     }
 
     /// 停止单条规则，等待其任务退出（最多 5 秒）。
+    ///
+    /// 正在绑定端口的启动也一并作废：它绑完会发现代数变了，自行放弃。
     pub async fn stop_rule(&self, id: &str) -> Result<()> {
         let (cancel, handle) = {
             let mut states = self.states.write();
             let state = states
                 .get_mut(id)
                 .ok_or_else(|| Error::UnknownRule(id.to_owned()))?;
+            if matches!(state.status, RuleStatus::Running | RuleStatus::Starting) {
+                // 状态当场改好，而不是等监听任务退出时再回写：下面最多只等 5 秒，
+                // 等不到的话任务会在稍后某个时刻收尾，那时规则也许已被重新启动了。
+                state.generation += 1;
+                state.status = RuleStatus::Stopped;
+            }
             (state.cancel.take(), state.handle.take())
         };
 
@@ -266,36 +290,66 @@ impl Engine {
 
     /// 热重载配置：停止已删除的规则，新增规则的状态条目，已有规则继续运行。
     pub async fn reload(&self, new_config: Config) {
-        let old_ids: std::collections::HashSet<String> = self
+        let new_ids: HashSet<&str> = new_config.rules.iter().map(|r| r.id.as_str()).collect();
+        let removed: Vec<String> = self
             .config
             .read()
             .rules
             .iter()
+            .filter(|r| !new_ids.contains(r.id.as_str()))
             .map(|r| r.id.clone())
             .collect();
-        let new_ids: std::collections::HashSet<String> =
-            new_config.rules.iter().map(|r| r.id.clone()).collect();
 
-        // 停止已删除的规则
-        for removed in old_ids.difference(&new_ids) {
-            let _ = self.stop_rule(removed).await;
+        for id in &removed {
+            let _ = self.stop_rule(id).await;
         }
-
-        // 更新配置
-        *self.config.write() = new_config.clone();
-
-        // 为新增规则创建状态条目
-        let mut states = self.states.write();
-        for rule in &new_config.rules {
-            states.entry(rule.id.clone()).or_insert_with(RuleState::new);
-        }
+        self.replace_config(new_config);
 
         tracing::info!("{}", crate::i18n::tr("log.reload"));
     }
 
+    /// 换用另一个配置文件：`config` 是 `path` 里的内容，此后的改动都写到 `path`。
+    ///
+    /// 新配置里定义一字未改的规则照常运行——只是挪了个位置的配置不必打断正在跑的
+    /// 规则；其余在跑的（被删掉的、同一个 ID 定义已经不同的）先停掉：同一个 ID 在
+    /// 两个文件里可能是完全不同的两条规则，不能拿旧的定义接着跑。新文件的应用设置
+    /// （语言、日志）即时生效。不写盘：`path` 里本来就是这份内容。
+    pub async fn switch_config(&self, config: Config, path: PathBuf) {
+        let changed: Vec<String> = self
+            .config
+            .read()
+            .rules
+            .iter()
+            .filter(|old| config.rule(&old.id) != Some(*old))
+            .map(|r| r.id.clone())
+            .collect();
+
+        for id in &changed {
+            let _ = self.stop_rule(id).await;
+        }
+        apply_app_settings(&config.app);
+        {
+            // 与 persist 互斥：别让一次正在进行的保存把旧配置写进新文件。
+            let _persist = self.persist_lock.lock();
+            *self.config_path.write() = Some(path);
+            self.replace_config(config);
+        }
+    }
+
+    /// 换上新配置，状态表随之对齐：摘掉已不存在的规则，给新来的补条目。
+    /// 调用方负责先停掉要摘掉的规则。
+    fn replace_config(&self, config: Config) {
+        let mut states = self.states.write();
+        states.retain(|id, _| config.rule(id).is_some());
+        for rule in &config.rules {
+            states.entry(rule.id.clone()).or_insert_with(RuleState::new);
+        }
+        *self.config.write() = config;
+    }
+
     /// 配置文件路径。`None` 表示这份配置不来自磁盘，改动不会落盘。
-    pub fn config_path(&self) -> Option<&Path> {
-        self.config_path.as_deref()
+    pub fn config_path(&self) -> Option<PathBuf> {
+        self.config_path.read().clone()
     }
 
     /// 正在运行的规则数，供托盘图标状态与悬停提示使用。
@@ -308,12 +362,15 @@ impl Engine {
     }
 
     /// 把当前配置写回磁盘。未关联配置文件时静默成功。
+    ///
+    /// 快照在写盘锁里取：多次保存排着队进行，最后落盘的一定是最新的配置。
     pub fn persist(&self) -> Result<()> {
-        let Some(path) = &self.config_path else {
+        let _guard = self.persist_lock.lock();
+        let Some(path) = self.config_path() else {
             return Ok(());
         };
         let cfg = self.config.read().clone();
-        cfg.save(path)
+        cfg.save(&path)
     }
 
     /// 新增规则，或按 ID 覆盖已有规则，随后落盘。
@@ -329,10 +386,7 @@ impl Engine {
         let enabled = rule.enabled;
 
         let mut draft = self.config.read().clone();
-        match draft.rules.iter().position(|r| r.id == id) {
-            Some(i) => draft.rules[i] = rule,
-            None => draft.rules.push(rule),
-        }
+        draft.put_rule(rule.clone());
         draft.validate()?;
 
         let was_running = self.rule_status(&id) == Some(RuleStatus::Running);
@@ -340,7 +394,16 @@ impl Engine {
             let _ = self.stop_rule(&id).await;
         }
 
-        *self.config.write() = draft;
+        // 等旧实例退出的这段时间里，别处可能改过配置（比如切换了另一条规则的开关）。
+        // 在最新的配置上再套一次这条改动，而不是把开头那份副本整个写回去——
+        // 那会把别人的改动悄悄覆盖掉。
+        {
+            let mut config = self.config.write();
+            let mut latest = config.clone();
+            latest.put_rule(rule);
+            latest.validate()?;
+            *config = latest;
+        }
         self.states
             .write()
             .entry(id.clone())
@@ -391,12 +454,17 @@ impl Engine {
     /// 副作用先于写盘生效：即便写盘失败，界面语言与日志行为也已跟上用户的选择，
     /// 调用方拿到的错误只关乎持久化。
     pub fn update_app_config(&self, app: AppConfig) -> Result<()> {
-        crate::i18n::set_language(app.language);
-        crate::log::set_logging_enabled(app.logging_enabled);
-        crate::log::set_level(app.log_level);
+        apply_app_settings(&app);
         self.config.write().app = app;
         self.persist()
     }
+}
+
+/// 把应用设置里即时生效的几项（界面语言、日志开关与级别）应用到本进程。
+fn apply_app_settings(app: &AppConfig) {
+    crate::i18n::set_language(app.language);
+    crate::log::set_logging_enabled(app.logging_enabled);
+    crate::log::set_level(app.log_level);
 }
 
 #[cfg(test)]
@@ -551,8 +619,78 @@ mod tests {
         next.rules.push(rule("b", 9351));
         e.reload(next).await;
 
+        assert_eq!(e.rule_status("a"), None, "已删除规则的状态条目应当摘掉");
         assert_eq!(e.rule_status("b"), Some(RuleStatus::Stopped));
         assert_eq!(e.config().rules[0].id, "b");
+        assert_eq!(e.all_statuses().len(), 1);
+    }
+
+    // ── 启停 ───────────────────────────────────────────────
+
+    /// 系统分配一个此刻空闲的端口。拿到后立即释放，留给规则去绑。
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("分配空闲端口")
+            .port()
+    }
+
+    /// 停下之后立刻再启动：旧监听任务的收尾不能把新实例的状态改掉。
+    #[tokio::test]
+    async fn restart_right_after_stop() {
+        let e = engine();
+        e.upsert_rule(rule("a", free_port())).await.unwrap();
+        for _ in 0..20 {
+            e.start_rule("a").await.unwrap();
+            assert_eq!(e.rule_status("a"), Some(RuleStatus::Running));
+            e.stop_rule("a").await.unwrap();
+            assert_eq!(e.rule_status("a"), Some(RuleStatus::Stopped));
+        }
+        assert_eq!(e.running_count(), 0);
+    }
+
+    // ── switch_config ──────────────────────────────────────
+
+    /// 换配置文件：定义一字未改的规则照常运行，改过的停掉，没了的连状态一起摘掉，
+    /// 此后的改动写进新文件。
+    #[tokio::test]
+    async fn switch_config_keeps_only_identical_rules_running() {
+        let e = engine();
+        let same = rule("same", free_port());
+        let changed = rule("changed", free_port());
+        let gone = rule("gone", free_port());
+        for r in [&same, &changed, &gone] {
+            e.upsert_rule(r.clone()).await.unwrap();
+            e.start_rule(&r.id).await.unwrap();
+        }
+
+        let mut next = Config::default_empty();
+        next.rules.push(same.clone());
+        next.rules.push(Rule {
+            name: "renamed".to_owned(),
+            ..changed.clone()
+        });
+        next.rules.push(rule("new", 9360));
+
+        let path = std::env::temp_dir().join(format!(
+            "aoproxy_switch_{}_{}.toml",
+            std::process::id(),
+            free_port()
+        ));
+        e.switch_config(next, path.clone()).await;
+
+        assert_eq!(e.rule_status("same"), Some(RuleStatus::Running));
+        assert_eq!(e.rule_status("changed"), Some(RuleStatus::Stopped));
+        assert_eq!(e.rule_status("gone"), None);
+        assert_eq!(e.rule_status("new"), Some(RuleStatus::Stopped));
+        assert_eq!(e.config_path(), Some(path.clone()));
+
+        e.set_rule_enabled("new", false).await.unwrap();
+        let saved = Config::load(&path).expect("改动应写进新文件");
+        assert!(!saved.rule("new").unwrap().enabled);
+
+        e.stop_all().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── persist ────────────────────────────────────────────

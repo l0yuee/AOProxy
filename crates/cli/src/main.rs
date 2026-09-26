@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
-use aoproxy_core::{config, i18n, log as aolog, Config, Engine, Language, LogLevel, RuleStatus};
+use aoproxy_core::{config, i18n, log as aolog, Config, Engine, Language, LogLevel};
 
 // ─────────────── 顶层 CLI ───────────────
 
@@ -162,17 +162,22 @@ async fn run(args: RunArgs) -> ExitCode {
         match resolve_config_path(args.config.as_deref()) {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                 return ExitCode::FAILURE;
             }
         }
     };
 
+    // 配置文件不存在就报错退出，而不是当成空配置：那样什么都没监听，
+    // 进程却一直挂着，`-c` 路径写错了也看不出来。
     let config = match &cfg_path {
-        Some(path) => match Config::load_or_default(path) {
+        Some(path) => match Config::load(path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
+                if is_not_found(&e) {
+                    eprintln!("{}", i18n::tr("cli.config_missing_hint"));
+                }
                 return ExitCode::FAILURE;
             }
         },
@@ -186,7 +191,7 @@ async fn run(args: RunArgs) -> ExitCode {
     };
 
     if let Err(e) = config.validate() {
-        eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+        eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
         return ExitCode::FAILURE;
     }
 
@@ -227,17 +232,23 @@ async fn run(args: RunArgs) -> ExitCode {
         tracing::error!(
             rule_id = %id,
             "{}",
-            i18n::tr_args("log.rule_failed", &[("reason", &e.to_string())])
+            i18n::tr_args("log.rule_failed", &[("reason", &e.localized())])
         );
     }
 
-    if !args.rules.is_empty() && errors.len() == args.rules.len() {
-        eprintln!("{}", i18n::tr("cli.all_failed"));
+    // 一条规则都没跑起来就退出，而不是守着一个空进程等 Ctrl+C：在 systemd 下那看起来
+    // 一切正常（active），实际什么都没在监听，Restart=on-failure 也无从介入。
+    let running = engine.running_count();
+    if running == 0 {
+        let reason = if errors.is_empty() {
+            i18n::tr("log.no_rules")
+        } else {
+            i18n::tr("cli.all_failed")
+        };
+        eprintln!("{reason}");
         return ExitCode::FAILURE;
     }
-
-    let running = engine.all_statuses().iter().filter(|(_, s, _)| *s == RuleStatus::Running).count();
-    if logging_enabled && running > 0 {
+    if logging_enabled {
         tracing::info!("{}", i18n::tr_args("cli.running", &[("count", &running.to_string())]));
     }
 
@@ -281,7 +292,7 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
             match cfg_path_result {
                 Ok(p) => println!("{}", p.display()),
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             }
@@ -290,7 +301,7 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
             let path = match cfg_path_result {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             };
@@ -303,7 +314,7 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
             match cfg.save(&path) {
                 Ok(()) => println!("{}", i18n::tr_args("cli.config_written", &[("path", &path.display().to_string())])),
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             }
@@ -312,7 +323,7 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
             let path = match cfg_path_result {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             };
@@ -324,12 +335,12 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
                         println!("{}", i18n::tr_args("cli.config_ok", &[("count", &count.to_string())]));
                     }
                     Err(e) => {
-                        eprintln!("{}", i18n::tr_args("cli.config_invalid", &[("reason", &e.to_string())]));
+                        eprintln!("{}", i18n::tr_args("cli.config_invalid", &[("reason", &e.localized())]));
                         return ExitCode::FAILURE;
                     }
                 },
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             }
@@ -338,7 +349,7 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
             let path = match cfg_path_result {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             };
@@ -351,7 +362,7 @@ fn config_cmd(args: ConfigArgs) -> ExitCode {
                     }
                 },
                 Err(e) => {
-                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.to_string())]));
+                    eprintln!("{}", i18n::tr_args("cli.error", &[("reason", &e.localized())]));
                     return ExitCode::FAILURE;
                 }
             }
@@ -484,11 +495,19 @@ fn parse_upstream_url(url: &str) -> Result<aoproxy_core::Upstream, String> {
 
 // ─────────────── 工具函数 ───────────────
 
-fn resolve_config_path(override_path: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
-    match override_path {
-        Some(p) => Ok(p.to_owned()),
-        None => config::config_path().map_err(|e| anyhow::anyhow!("{e}")),
-    }
+/// 配置文件路径：`-c` 优先，其次是 GUI 设置页记下的位置，最后是平台默认位置。
+/// 与 GUI 走同一个函数，两边读写的始终是同一份配置。
+fn resolve_config_path(explicit: Option<&std::path::Path>) -> aoproxy_core::Result<PathBuf> {
+    config::resolve_config_path(explicit)
+}
+
+/// 是不是「配置文件不存在」：这种情况要多给一句怎么生成配置的提示。
+fn is_not_found(e: &aoproxy_core::Error) -> bool {
+    matches!(
+        e,
+        aoproxy_core::Error::ConfigRead { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 fn parse_log_level(s: &str) -> LogLevel {

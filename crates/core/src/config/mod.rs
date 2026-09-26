@@ -100,21 +100,33 @@ impl Config {
     }
 
     /// 序列化并写入文件，先写临时文件再原子重命名，防止写到一半崩溃导致配置损坏。
+    ///
+    /// 配置文件若是符号链接（dotfiles 仓库里常见），写到它指向的文件上：
+    /// 直接改名会把链接本身换成一个普通文件，链接那头从此不再更新。
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self)?;
+        let path = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+            }
+            _ => path.to_owned(),
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::ConfigWrite {
-                path: path.to_owned(),
+                path: path.clone(),
                 source: e,
             })?;
         }
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &content).map_err(|e| Error::ConfigWrite {
-            path: tmp.clone(),
-            source: e,
+        let tmp = tmp_path(&path);
+        write_tmp(&tmp, content.as_bytes(), &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::ConfigWrite {
+                path: tmp.clone(),
+                source: e,
+            }
         })?;
-        std::fs::rename(&tmp, path).map_err(|e| Error::ConfigWrite {
-            path: path.to_owned(),
+        std::fs::rename(&tmp, &path).map_err(|e| Error::ConfigWrite {
+            path: path.clone(),
             source: e,
         })?;
         Ok(())
@@ -170,6 +182,14 @@ impl Config {
     /// 按 ID 查找并可变借用规则。
     pub fn rule_mut(&mut self, id: &str) -> Option<&mut Rule> {
         self.rules.iter_mut().find(|r| r.id == id)
+    }
+
+    /// 按 ID 覆盖同名规则，没有同名的就追加到末尾。不做校验。
+    pub fn put_rule(&mut self, rule: Rule) {
+        match self.rule_mut(&rule.id) {
+            Some(slot) => *slot = rule,
+            None => self.rules.push(rule),
+        }
     }
 
     /// 逐条深度校验 TLS 证书与私钥是否配对，返回首个错误。
@@ -260,7 +280,7 @@ impl std::fmt::Display for LogLevel {
 }
 
 /// 一条转发规则。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     /// 规则唯一标识符，只允许字母、数字、连字符和下划线。
@@ -399,7 +419,7 @@ pub enum Mode {
 }
 
 /// 出站上游配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     /// 上游类型，默认直连。
@@ -460,7 +480,7 @@ pub enum UpstreamKind {
 }
 
 /// 入站 TLS 配置（可选）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// PEM 格式证书链文件路径。
@@ -507,7 +527,7 @@ impl TlsConfig {
 }
 
 /// 入站认证配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// 认证类型。
@@ -586,10 +606,141 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// 位置文件名，与默认配置文件同目录。
+///
+/// 记录「配置文件放在别处」：GUI 设置页里换了配置文件后写这里，此后 GUI 与 CLI 都照着
+/// 它找配置；删掉它就回到默认位置。这件事不能记在配置文件本身里：得先知道配置文件在哪，
+/// 才读得到它。
+const LOCATION_FILE: &str = "location.toml";
+
+/// 当前生效的配置文件路径：显式给出的（命令行 `-c`）优先，其次是位置文件里记下的，
+/// 最后是 [`config_path`] 给出的平台默认位置。
+pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_owned());
+    }
+    let default = config_path()?;
+    Ok(read_location(&default.with_file_name(LOCATION_FILE))?.unwrap_or(default))
+}
+
+/// 记下配置文件的新位置。`path` 就是默认位置时删掉位置文件，回到从没改过的状态。
+pub fn set_config_location(path: &Path) -> Result<()> {
+    let default = config_path()?;
+    write_location(&default.with_file_name(LOCATION_FILE), path, &default)
+}
+
+/// 位置文件的内容。
+#[derive(Serialize, Deserialize)]
+struct Location {
+    /// 配置文件的完整路径。
+    config: PathBuf,
+}
+
+/// 读位置文件。文件不存在返回 `None`；存在却读不了、写坏了都报错，
+/// 而不是悄悄退回默认位置——那样改的就不是用户以为的那份配置了。
+fn read_location(file: &Path) -> Result<Option<PathBuf>> {
+    let content = match std::fs::read_to_string(file) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::ConfigRead {
+                path: file.to_owned(),
+                source: e,
+            })
+        }
+    };
+    let location: Location = toml::from_str(&content).map_err(|e| Error::ConfigParse {
+        path: file.to_owned(),
+        source: e,
+    })?;
+    // 手写进去的相对路径按位置文件所在目录解析，与当前工作目录无关。
+    Ok(Some(match file.parent() {
+        Some(dir) if location.config.is_relative() => dir.join(location.config),
+        _ => location.config,
+    }))
+}
+
+fn write_location(file: &Path, path: &Path, default: &Path) -> Result<()> {
+    let write_err = |e| Error::ConfigWrite {
+        path: file.to_owned(),
+        source: e,
+    };
+    if path == default {
+        return match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(write_err(e)),
+            _ => Ok(()),
+        };
+    }
+
+    let body = toml::to_string(&Location {
+        config: path.to_owned(),
+    })?;
+    let content = format!(
+        "# AOProxy 配置文件的位置，由图形界面的设置页写入。删掉本文件即回到默认位置。\n\
+         # Where AOProxy keeps its config file, set from the GUI. Delete this file to use the default location.\n\
+         {body}"
+    );
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(write_err)?;
+    }
+    std::fs::write(file, content).map_err(write_err)
+}
+
 // ─────────────── 内部辅助 ───────────────
+
+/// 保存用的临时文件：在原文件名后追加 `.tmp`。不用 `with_extension` 替换扩展名，
+/// 否则 `a.toml` 与 `a.conf` 会撞到同一个临时文件上。
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// 写入临时文件并落盘。
+///
+/// 配置里有代理密码，所以权限在写入内容之前就定好：Unix 上沿用原文件的权限位
+/// （用户收紧过的不能被放宽回 umask 的默认值），原文件不存在时用 0600。
+/// 上次崩溃遗留的同名临时文件保留着它自己的权限，所以不能只靠创建时的 mode。
+///
+/// `sync_all` 之后才改名：否则断电时可能改名已生效、内容却还没写下去，留下一个空配置。
+fn write_tmp(tmp: &Path, content: &[u8], original: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = std::fs::metadata(original)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o600);
+        options.mode(mode);
+        mode
+    };
+    #[cfg(not(unix))]
+    let _ = original;
+
+    let mut file = options.open(tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    file.write_all(content)?;
+    file.sync_all()
+}
 
 fn parse_listen(s: &str) -> std::result::Result<SocketAddr, std::net::AddrParseError> {
     SocketAddr::from_str(s)
+}
+
+/// [`parse_host_port`] 的逆运算：IPv6 字面量补上方括号，`::1` + 443 → `[::1]:443`。
+pub(crate) fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 pub(crate) fn parse_host_port(s: &str) -> std::result::Result<(&str, u16), ()> {
@@ -835,5 +986,95 @@ mod tests {
         assert_eq!(original.rules[0].listen, loaded.rules[0].listen);
         assert_eq!(original.rules[1].id,     loaded.rules[1].id);
         assert_eq!(original.version,         loaded.version);
+    }
+
+    // ── 配置文件位置 ────────────────────────────────────────
+
+    /// 每个用例一个独立的临时目录，名字带进程号与纳秒，并行跑也不会撞。
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoproxy_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn location_round_trip_and_reset() {
+        let dir = scratch_dir("location");
+        let file = dir.join(LOCATION_FILE);
+        let default = dir.join("config.toml");
+        // 带空格与反斜杠的路径在 TOML 里要正确转义，读回来得一字不差。
+        let custom = dir.join("my configs").join(r"a\b.toml");
+
+        assert_eq!(read_location(&file).unwrap(), None, "没有位置文件时用默认位置");
+
+        write_location(&file, &custom, &default).unwrap();
+        assert_eq!(read_location(&file).unwrap(), Some(custom));
+
+        // 换回默认位置等于删掉位置文件。
+        write_location(&file, &default, &default).unwrap();
+        assert!(!file.exists());
+        assert_eq!(read_location(&file).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn location_relative_path_is_relative_to_its_file() {
+        let dir = scratch_dir("location_rel");
+        let file = dir.join(LOCATION_FILE);
+        std::fs::write(&file, "config = \"sub/aoproxy.toml\"\n").unwrap();
+        assert_eq!(read_location(&file).unwrap(), Some(dir.join("sub/aoproxy.toml")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 位置文件写坏了要报出来，不能悄悄退回默认位置去改另一份配置。
+    #[test]
+    fn location_malformed_is_an_error() {
+        let dir = scratch_dir("location_bad");
+        let file = dir.join(LOCATION_FILE);
+        std::fs::write(&file, "config = \n").unwrap();
+        assert!(matches!(read_location(&file), Err(Error::ConfigParse { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_path_wins() {
+        let explicit = Path::new("/somewhere/else.toml");
+        assert_eq!(resolve_config_path(Some(explicit)).unwrap(), explicit);
+    }
+
+    /// 配置里有密码。新建的文件只给属主读写；用户手动收紧过的权限，
+    /// 保存（写临时文件再改名）之后也不能被悄悄放宽回 umask 的默认值。
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aoproxy_perm_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let path = dir.join("config.toml");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        Config::example().save(&path).expect("首次保存");
+        assert_eq!(mode(&path), 0o600, "新建的配置文件不该对其他用户可读");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        Config::example().save(&path).expect("再次保存");
+        assert_eq!(mode(&path), 0o640, "保存后应当沿用文件原有的权限");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

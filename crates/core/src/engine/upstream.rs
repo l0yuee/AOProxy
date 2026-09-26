@@ -14,7 +14,7 @@ use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::config::{Upstream, UpstreamKind};
+use crate::config::{join_host_port, Upstream, UpstreamKind};
 use crate::error::{Error, Result};
 
 /// 上游拨号结果：实现了 [`AsyncRead`] + [`AsyncWrite`] 的连接。
@@ -119,7 +119,7 @@ pub async fn dial(
 async fn dial_direct(host: &str, port: u16) -> Result<UpstreamConn> {
     let stream = TcpStream::connect((host, port)).await.map_err(|e| {
         Error::UpstreamUnreachable {
-            address: format!("{host}:{port}"),
+            address: join_host_port(host, port),
             source: e,
         }
     })?;
@@ -138,23 +138,24 @@ async fn dial_http_connect(
     password: &Option<String>,
     use_tls: bool,
 ) -> Result<UpstreamConn> {
+    let proxy_address = join_host_port(proxy_host, proxy_port);
     let tcp = TcpStream::connect((proxy_host, proxy_port))
         .await
         .map_err(|e| Error::UpstreamUnreachable {
-            address: format!("{proxy_host}:{proxy_port}"),
+            address: proxy_address.clone(),
             source: e,
         })?;
     tcp.set_nodelay(true).ok();
 
-    let conn: UpstreamConn = if use_tls {
+    let mut conn: UpstreamConn = if use_tls {
         let tls_stream = upgrade_tls(tcp, proxy_host).await?;
         UpstreamConn::Tls(Box::new(tls_stream))
     } else {
         UpstreamConn::Tcp(tcp)
     };
 
-    // 发送 CONNECT 请求
-    let authority = format!("{target_host}:{target_port}");
+    // 发送 CONNECT 请求。IPv6 字面量必须带方括号，否则 `::1:443` 分不出哪段是端口。
+    let authority = join_host_port(target_host, target_port);
     let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let (Some(u), Some(p)) = (username.as_deref(), password.as_deref()) {
         let cred = base64::engine::general_purpose::STANDARD
@@ -164,95 +165,65 @@ async fn dial_http_connect(
     req.push_str("\r\n");
 
     use tokio::io::AsyncWriteExt;
-    match conn {
-        UpstreamConn::Tcp(mut s) => {
-            s.write_all(req.as_bytes()).await.map_err(|e| Error::UpstreamUnreachable {
-                address: format!("{proxy_host}:{proxy_port}"),
-                source: e,
-            })?;
-            let stream = read_connect_response(s, target_host, target_port).await?;
-            Ok(UpstreamConn::Tcp(stream))
-        }
-        UpstreamConn::Tls(mut s) => {
-            s.write_all(req.as_bytes()).await.map_err(|e| Error::UpstreamUnreachable {
-                address: format!("{proxy_host}:{proxy_port}"),
-                source: e,
-            })?;
-            let stream = read_connect_response_tls(*s, target_host, target_port).await?;
-            Ok(UpstreamConn::Tls(Box::new(stream)))
-        }
-        // Nested 仅由 wrap_tls 创建，dial_http_connect 内部不会产生此变体。
-        UpstreamConn::Nested(_) => unreachable!("Nested variant cannot appear inside dial_http_connect"),
-    }
+    conn.write_all(req.as_bytes())
+        .await
+        .map_err(|e| Error::UpstreamUnreachable {
+            address: proxy_address,
+            source: e,
+        })?;
+    read_connect_response(&mut conn, &authority).await?;
+    Ok(conn)
 }
 
-async fn read_connect_response(
-    mut stream: TcpStream,
-    target_host: &str,
-    target_port: u16,
-) -> Result<TcpStream> {
+/// CONNECT 应答头的长度上限。正常的应答只有几十个字节，这个值只用来挡住
+/// 不停发数据却始终不给空行的上游，免得缓冲无限长大。
+const MAX_CONNECT_RESPONSE: usize = 8 * 1024;
+
+/// 读 CONNECT 应答头，读到空行为止，并确认状态码是 200。
+///
+/// 逐字节读：应答头之后紧跟着的就是隧道数据——服务端先说话的协议（SSH、SMTP）
+/// 会和应答挤在同一个包里到达，成块读会把它们一并吞进缓冲、随后丢掉。
+/// 应答头只有几十个字节，逐字节读的代价可以忽略；TLS 上游读的是 rustls 已解密的
+/// 缓冲，也不会每个字节都陷一次内核。
+async fn read_connect_response<S>(stream: &mut S, target: &str) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; 512];
-    let mut total = 0;
-    loop {
-        let n = stream.read(&mut buf[total..]).await.map_err(Error::Io)?;
-        if n == 0 {
+
+    let mut head = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && head.len() < MAX_CONNECT_RESPONSE {
+        if stream.read(&mut byte).await.map_err(Error::Io)? == 0 {
             break;
         }
-        total += n;
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if total == buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
+        head.push(byte[0]);
     }
-    parse_connect_status(&buf[..total], target_host, target_port)?;
-    Ok(stream)
+
+    match parse_connect_status(&head) {
+        200 if head.ends_with(b"\r\n\r\n") => Ok(()),
+        // 状态行是 200，应答头却没说完就断了或超长：隧道的起点无从确定。
+        200 => Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete CONNECT response from upstream proxy",
+        ))),
+        status => Err(Error::UpstreamConnectRejected {
+            target: target.to_owned(),
+            status,
+        }),
+    }
 }
 
-async fn read_connect_response_tls(
-    mut stream: tokio_rustls::client::TlsStream<TcpStream>,
-    target_host: &str,
-    target_port: u16,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; 512];
-    let mut total = 0;
-    loop {
-        let n = stream.read(&mut buf[total..]).await.map_err(Error::Io)?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if total == buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
-    }
-    parse_connect_status(&buf[..total], target_host, target_port)?;
-    Ok(stream)
-}
-
-fn parse_connect_status(response: &[u8], target_host: &str, target_port: u16) -> Result<()> {
+/// 取状态行里的状态码（`HTTP/1.1 200 Connection established` → 200），认不出来时为 0。
+fn parse_connect_status(response: &[u8]) -> u16 {
     let text = String::from_utf8_lossy(response);
-    let first = text.lines().next().unwrap_or("");
-    // "HTTP/1.x 200 Connection established"
-    let status: u16 = first
+    text.lines()
+        .next()
+        .unwrap_or("")
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if status == 200 {
-        Ok(())
-    } else {
-        Err(Error::UpstreamConnectRejected {
-            target: format!("{target_host}:{target_port}"),
-            status,
-        })
-    }
+        .unwrap_or(0)
 }
 
 // ─────────────── SOCKS5 ───────────────
@@ -267,7 +238,7 @@ async fn dial_socks5(
 ) -> Result<UpstreamConn> {
     use tokio_socks::tcp::Socks5Stream;
 
-    let proxy_addr = format!("{proxy_host}:{proxy_port}");
+    let proxy_addr = join_host_port(proxy_host, proxy_port);
 
     // 判断 target 是 IP 还是域名，以便选对 tokio-socks API
     let stream = if let Ok(ip) = target_host.parse::<IpAddr>() {

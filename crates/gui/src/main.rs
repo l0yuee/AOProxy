@@ -8,19 +8,28 @@
 //! 程序日志改由 [`LogBuffer`] 环形缓冲承载，在界面日志面板里看。
 //! debug 构建保留控制台，方便开发期直接看 Qt 的诊断输出。
 //!
+//! 命令行参数（Qt 自己的参数如 `-platform` 由 Qt 处理）：
+//!
+//! - `-c <FILE>` / `--config <FILE>`：本次运行用这个配置文件，不改设置页记下的位置。
+//! - `--autostart`：开机自启时由系统带上，见 [`aoproxy_core::autostart`]。
+//!
 //! [`LogBuffer`]: aoproxy_core::log::LogBuffer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
 mod single_instance;
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQuickStyle, QString, QUrl};
 
-use aoproxy_core::{config, i18n, Config, Engine as AoEngine, Language};
+use aoproxy_core::{autostart, config, i18n, Config, Engine as AoEngine, Error, Language};
 
 fn main() {
+    let args = LaunchArgs::parse(std::env::args_os().skip(1));
+
     // 单实例守卫放在最前面：抢不到锁说明已有窗口在跑，把它唤到前台然后安静退出。
     // 早于 runtime 与 Qt 的一切初始化——第二次启动不该闪一下窗口再消失。
     let show_rx = match single_instance::acquire() {
@@ -46,11 +55,23 @@ fn main() {
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();
 
-    // 语言在读配置之前设定，后续日志才会走对应译文。
+    // 先按系统语言，读到配置后再换成配置里的：加载出错时的提示也得有个语言。
     i18n::set_language(Language::detect());
 
-    let config_path = config::config_path().unwrap_or_default();
-    let cfg = Config::load_or_default(&config_path);
+    // 配置文件：命令行 `--config` > 设置页记下的位置 > 平台默认。
+    // 位置文件坏了就退回默认位置，同时把错误挂出来，而不是连界面都起不来。
+    let default_config_path = config::config_path().unwrap_or_default();
+    let (config_path, location_error) = match config::resolve_config_path(args.config.as_deref()) {
+        Ok(path) => (path, None),
+        Err(e) => (default_config_path.clone(), Some(e)),
+    };
+    let cfg = load_config(&config_path);
+
+    // 语言跟着配置走：设置页里选了什么，下次启动就是什么，
+    // 否则下拉框里写着 English，界面却还是按系统语言显示的中文。
+    if let Ok(c) = &cfg {
+        i18n::set_language(c.app.language);
+    }
 
     // 初始化日志（GUI 模式：写 stderr 同时写环形缓冲）
     let (log_buf, log_rx) = aoproxy_core::log::LogBuffer::new();
@@ -60,8 +81,9 @@ fn main() {
     };
     aoproxy_core::log::init(log_enabled, log_level, Some(log_buf.clone()));
 
-    if let Err(e) = &cfg {
-        tracing::error!("配置加载失败: {e}");
+    let startup_error = location_error.as_ref().or(cfg.as_ref().err()).map(Error::localized);
+    if let Some(e) = &startup_error {
+        tracing::error!("{e}");
     }
 
     // 三个桥接对象由 QML 各自实例化，必须共享同一份引擎与日志缓冲。
@@ -74,7 +96,12 @@ fn main() {
         log_buf,
         log_rx,
         show_rx,
-        config_path.display().to_string(),
+        bridge::shared::Launch {
+            config_path,
+            default_config_path,
+            launched_at_login: args.autostart,
+            startup_error,
+        },
     );
 
     // 加载 QML 主界面（通过 cxx-qt-build 打包到资源系统）
@@ -89,4 +116,50 @@ fn main() {
 
     // exec() 返回 Qt 的退出码，直接作为进程退出码。
     std::process::exit(app.pin_mut().exec());
+}
+
+/// 读配置。文件还不存在算正常：从空配置起步，第一次改动时写盘；
+/// 界面语言此时跟随系统，并记进配置，设置页的下拉框才与界面一致。
+fn load_config(path: &std::path::Path) -> aoproxy_core::Result<Config> {
+    match Config::load(path) {
+        Err(Error::ConfigRead { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            let mut fresh = Config::default_empty();
+            fresh.app.language = Language::detect();
+            Ok(fresh)
+        }
+        other => other,
+    }
+}
+
+/// 本程序认的命令行参数。认不出的一律忽略：其中有 Qt 自己的参数。
+#[derive(Default)]
+struct LaunchArgs {
+    /// `-c <FILE>` / `--config <FILE>` / `--config=<FILE>`，相对路径按当前目录补全。
+    config: Option<PathBuf>,
+    /// [`autostart::LAUNCH_FLAG`]。
+    autostart: bool,
+}
+
+impl LaunchArgs {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Self {
+        let mut out = Self::default();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let path = if arg == autostart::LAUNCH_FLAG {
+                out.autostart = true;
+                None
+            } else if arg == "-c" || arg == "--config" {
+                args.next().map(PathBuf::from)
+            } else {
+                arg.to_str()
+                    .and_then(|s| s.strip_prefix("--config="))
+                    .map(PathBuf::from)
+            };
+            if let Some(path) = path {
+                // 设置页上要显示完整路径；工作目录之后也可能变，趁现在补全。
+                out.config = Some(std::path::absolute(&path).unwrap_or(path));
+            }
+        }
+        out
+    }
 }

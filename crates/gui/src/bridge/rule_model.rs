@@ -5,12 +5,11 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use cxx_qt_lib::QString;
 
 use aoproxy_core::engine::forward::format_bytes;
-use aoproxy_core::{Engine, RuleStatus};
+use aoproxy_core::RuleStatus;
 
 // ─────────────────────── 行数据 ───────────────────────
 
@@ -34,8 +33,9 @@ pub struct RuleRow {
 
 // ─────────────────────── Rust 状态 ───────────────────────
 
+/// 不存引擎：它每次刷新时去共享上下文里取（见 [`RuleModelState::rebuild_rows`]）。
+#[derive(Default)]
 pub struct RuleModelState {
-    engine: Option<Arc<Engine>>,
     rows: Vec<RuleRow>,
     /// 行数的属性镜像。`rowCount()` 是函数，QML 的绑定不会因它的返回值
     /// 变化而重算；顶栏要显示「运行中 x / 总数」，总数就得是个带变更信号的
@@ -43,21 +43,14 @@ pub struct RuleModelState {
     count: i32,
 }
 
-impl Default for RuleModelState {
-    fn default() -> Self {
-        Self {
-            engine: super::shared::engine(),
-            rows: Vec::new(),
-            count: 0,
-        }
-    }
-}
-
 impl RuleModelState {
     /// 按配置中的规则顺序生成行；引擎的状态表只提供 `(id, 状态, 统计)`，
     /// 且无序，所以只用来按 ID 查状态。
+    ///
+    /// 引擎每次都去共享上下文里取：启动时配置读不出来就没有引擎，
+    /// 要等设置页换上能读的配置文件才有。
     fn rebuild_rows(&mut self) {
-        let Some(engine) = &self.engine else {
+        let Some(engine) = super::shared::engine() else {
             self.rows.clear();
             return;
         };
