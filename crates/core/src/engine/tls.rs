@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rustls_pemfile::{certs, private_key};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::TlsConfig;
@@ -49,24 +49,13 @@ fn load_key(path: &Path) -> Result<rustls_pki_types::PrivateKeyDer<'static>> {
         source: e,
     })?;
 
-    // 先尝试 PKCS#8，再尝试传统 RSA 格式
-    let mut cursor = std::io::Cursor::new(&pem);
-    let mut keys: Vec<_> = pkcs8_private_keys(&mut cursor)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap_or_default();
-    if !keys.is_empty() {
-        return Ok(rustls_pki_types::PrivateKeyDer::Pkcs8(keys.remove(0)));
+    // PKCS#8、传统 RSA（PKCS#1）与 SEC1（`BEGIN EC PRIVATE KEY`）都认，取文件里的第一把。
+    // 只认前两种的话，`openssl ecparam -genkey`、acme.sh 签出的 ECC 私钥都会被当成没有私钥。
+    // PEM 本身写坏了（缺结尾行之类）同样报「没有私钥」：对用户来说是同一件事。
+    match private_key(&mut std::io::Cursor::new(&pem)) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) | Err(_) => Err(Error::TlsNoKey(path.to_owned())),
     }
-
-    let mut cursor = std::io::Cursor::new(&pem);
-    let mut rsa_keys: Vec<_> = rsa_private_keys(&mut cursor)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap_or_default();
-    if !rsa_keys.is_empty() {
-        return Ok(rustls_pki_types::PrivateKeyDer::Pkcs1(rsa_keys.remove(0)));
-    }
-
-    Err(Error::TlsNoKey(path.to_owned()))
 }
 
 #[cfg(test)]
@@ -163,5 +152,44 @@ mod tests {
             key: absent(),
         };
         assert!(matches!(build_acceptor(&cfg), Err(Error::TlsNoCert(_))));
+    }
+
+    // ── 私钥格式 ───────────────────────────────────────────
+
+    /// 仅供测试的自签名 P-256 证书与私钥（`openssl ecparam -genkey` + `openssl req -x509`）。
+    const EC_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIUTGE/wDtF6liMGQc1gJ8xNZfTr0swCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMYW9wcm94eS10ZXN0MCAXDTI2MDkyNjEzMzE0M1oYDzIxMjYw
+OTAyMTMzMTQzWjAXMRUwEwYDVQQDDAxhb3Byb3h5LXRlc3QwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAARWj312OLxX8snfCSsCLexqu59JK+V2uWrLncJwHZzuGhgj
+UnMjjJua5JWJfI0eAhBNqAedvOwIKq6XejFCieEBo1MwUTAdBgNVHQ4EFgQUuaBw
+V/e9KqCOE587l24sfTU7OlgwHwYDVR0jBBgwFoAUuaBwV/e9KqCOE587l24sfTU7
+OlgwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiByc/e4T5PACEF0
+qDUgfaOgoqxrJdgYVkWLhQgRNTFu7gIhAM1e1OUGCsca0ZfQjaQnUDWZbIPcLtfs
+VRxVI7dToSPB
+-----END CERTIFICATE-----
+";
+
+    /// 上面那张证书的私钥，SEC1 格式（`BEGIN EC PRIVATE KEY`）。
+    const EC_KEY_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIJTDPhngr4Im6VdRRNeFBSo/TJYehJzJ4BJg5Rmoyel4oAoGCCqGSM49
+AwEHoUQDQgAEVo99dji8V/LJ3wkrAi3sarufSSvldrlqy53CcB2c7hoYI1JzI4yb
+muSViXyNHgIQTagHnbzsCCqul3oxQonhAQ==
+-----END EC PRIVATE KEY-----
+";
+
+    /// `openssl ecparam -genkey`、acme.sh 的 ECC 证书给出的都是 SEC1 私钥，
+    /// 只认 PKCS#8 与 PKCS#1 的话，这类证书一律报「没有私钥」。
+    #[test]
+    fn acceptor_accepts_sec1_ec_key() {
+        let cert = TempPem::new("eccert", EC_CERT);
+        let key = TempPem::new("eckey", EC_KEY_SEC1);
+        let cfg = TlsConfig {
+            cert: cert.path().to_owned(),
+            key: key.path().to_owned(),
+        };
+        if let Err(e) = build_acceptor(&cfg) {
+            panic!("SEC1 私钥应当可用：{e}");
+        }
     }
 }

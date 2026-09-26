@@ -159,6 +159,10 @@ WantedBy=multi-user.target
 （改配置是 GUI 的事），所以不需要 `ReadWritePaths`。`AF_UNIX` 要留着：
 名字解析可能经过本地套接字。
 
+一条规则都没能启动时（端口被占、证书读不了、配置里没有启用的规则），`aoproxy run` 报错并以
+退出码 1 结束，而不是空转——`Restart=on-failure` 于是会按 `RestartSec` 重试，
+`systemctl status` 也不会把一个什么都没在监听的进程显示成 `active (running)`。
+
 启用并启动：
 
 ```bash
@@ -313,10 +317,11 @@ sudo systemctl start aoproxy
 | `Address already in use` | 端口被占。`sudo ss -tlnp \| grep 8443` 看是谁，或改 `listen` |
 | `Permission denied` 绑定失败 | 端口 < 1024 而进程非 root。加 `AmbientCapabilities=CAP_NET_BIND_SERVICE` |
 | 启动即报证书读取失败 | 私钥属主/权限不对。见第 5 节，别直接指向 `/etc/letsencrypt/live` |
+| 报「没有私钥」 | 私钥文件里没有 PEM 格式的私钥。PKCS#8、RSA 与 EC（`BEGIN EC PRIVATE KEY`）格式都支持，加密过的私钥不支持 |
 | 启动即报证书与私钥不匹配 | `cert` 和 `key` 来自不同签发批次，重新复制同一批 |
-| 客户端连上就断 | 认证失败。journal 里有 `认证失败: <IP>`，核对本机端 upstream 的用户名密码 |
+| 客户端连上就断 | 认证失败。journal 里有 `<IP>:<端口> 认证失败`，核对本机端 upstream 的用户名密码 |
 | 客户端超时、服务端无日志 | 流量没到进程。检查防火墙与云厂商安全组 |
-| `systemctl status` 显示 `code=exited, status=1` | 配置校验没过。`journalctl -u aoproxy -n 20` 看具体那一条 |
+| `systemctl status` 显示 `code=exited, status=1` | 配置校验没过，或一条规则都没能启动（端口被占、证书读不了、没有启用的规则）。`journalctl -u aoproxy -n 20` 看具体那一条 |
 | 服务反复重启 | `Restart=on-failure` 在掩盖一个必然失败。先 `systemctl stop`，再用服务用户身份前台跑一次 |
 
 前台跑一次是最快的定位手段，错误直接打在终端上：

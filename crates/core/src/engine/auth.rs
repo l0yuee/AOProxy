@@ -111,7 +111,8 @@ pub fn check_path_token(cfg: &AuthConfig, path: &str) -> std::result::Result<Str
     }
 
     let rest = path.strip_prefix('/').unwrap_or(path);
-    let (first, tail) = match rest.find('/') {
+    // 令牌段到第一个 `/` 或 `?` 为止：`/tok?beta=true` 里的令牌是 `tok`。
+    let (first, tail) = match rest.find(['/', '?']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, ""),
     };
@@ -122,6 +123,8 @@ pub fn check_path_token(cfg: &AuthConfig, path: &str) -> std::result::Result<Str
 
     Ok(if tail.is_empty() {
         "/".to_owned()
+    } else if tail.starts_with('?') {
+        format!("/{tail}")
     } else {
         tail.to_owned()
     })
@@ -257,6 +260,15 @@ mod tests {
         assert_eq!(check_path_token(&cfg, "/tok123/v1/messages").unwrap(), "/v1/messages");
         assert_eq!(check_path_token(&cfg, "/tok123").unwrap(), "/");
         assert_eq!(check_path_token(&cfg, "/tok123/").unwrap(), "/");
+    }
+
+    /// 令牌后面直接跟查询串（`/tok123?beta=true`）时，令牌段到 `?` 为止。
+    #[test]
+    fn path_token_followed_by_query() {
+        let cfg = token_cfg();
+        assert_eq!(check_path_token(&cfg, "/tok123?beta=true").unwrap(), "/?beta=true");
+        assert_eq!(check_path_token(&cfg, "/tok123/v1?beta=true").unwrap(), "/v1?beta=true");
+        assert_eq!(check_path_token(&cfg, "/tok123x?beta=true"), Err(Outcome::Invalid));
     }
 
     #[test]

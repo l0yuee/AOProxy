@@ -345,19 +345,19 @@ impl tracing::field::Visit for FieldVisitor {
 
 // ─────────────── 宏辅助 ───────────────
 
-/// 带规则 ID 前缀的 info 日志，用于引擎内部。
+/// 属于某条规则的日志，用于引擎内部。
 ///
 /// ```ignore
 /// log_rule!(info, rule_id, "{msg}");
 /// log_rule!(warn, rule_id, "连接数 {}", count);
 /// ```
+///
+/// 规则 ID 只作为 `rule_id` 字段发出，正文里不再重复：CLI 的行格式与 GUI 的
+/// 日志面板都会把这个字段单独渲染成 `[id]`，正文里再带一份就成了 `[id] [id] …`。
 #[macro_export]
 macro_rules! log_rule {
     ($level:ident, $rule_id:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
-        ::tracing::$level!(
-            rule_id = $rule_id,
-            message = &*format!("[{}] {}", $rule_id, format_args!($fmt $(, $arg)*))
-        )
+        ::tracing::$level!(rule_id = $rule_id, $fmt $(, $arg)*)
     };
 }
 
@@ -538,6 +538,13 @@ mod tests {
         assert_eq!(error, "10:23:01 ERROR x\n");
         // 正文起始列相同才算对齐
         assert_eq!(warn.find('x'), error.find('x'));
+    }
+
+    /// `log_rule!` 发的日志里规则 ID 只出现一次：由行格式渲染成 `[id]`，正文不再带一份。
+    #[test]
+    fn log_rule_macro_does_not_repeat_the_rule_id() {
+        let out = render(false, || crate::log_rule!(info, "gateway", "监听 {}", "0.0.0.0:8443"));
+        assert_eq!(out, "10:23:01 INFO  [gateway] 监听 0.0.0.0:8443\n");
     }
 
     /// 重定向到文件时不能掺入转义序列，否则日志文件满屏 `ESC[32m`。

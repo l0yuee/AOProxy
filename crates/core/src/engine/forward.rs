@@ -6,9 +6,9 @@
 //! - `CONNECT ` → HTTP CONNECT 隧道
 //! - 其他 HTTP 方法 → 绝对形式 HTTP 代理
 //!
-//! 嗅探读走的那个字节会被 [`PeekStream`] 原样补回，后续解析看到的仍是完整的流。
-//! 处理器对入站流类型泛型，因此明文入站和 TLS 入站（握手在 [`listener`] 层完成）
-//! 走的是同一套代码。
+//! 第一个字节由 [`listener`] 读出（它顺带负责「迟迟不发数据」的超时），装在
+//! [`PeekStream`] 里交过来，后续解析看到的仍是完整的流。处理器对入站流类型泛型，
+//! 因此明文入站和 TLS 入站（握手也在 [`listener`] 层完成）走的是同一套代码。
 //!
 //! [`listener`]: crate::engine::listener
 
@@ -19,22 +19,25 @@ use std::time::Instant;
 use http::{Method, Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::Rule;
 use crate::engine::auth;
+use crate::engine::counter::{ByteCounters, CountingStream};
 use crate::engine::http_relay::{
     self, empty_body, relay_response, send_upstream, text_response, BoxError, ProxyBody,
 };
-use crate::engine::upstream;
+use crate::engine::listener::HANDSHAKE_TIMEOUT;
+use crate::engine::upstream::{self, UpstreamConn};
 use crate::status::Stats;
 
 // ─────────────── 公开入口 ───────────────
 
-/// 处理一条正向代理连接。`stream` 已是明文（TLS 入站在上层解密）。
+/// 处理一条正向代理连接。`stream` 已是明文（TLS 入站在上层解密），首字节已读出待还。
 pub async fn handle_forward<S>(
-    mut stream: S,
+    stream: PeekStream<S>,
     peer_addr: SocketAddr,
     rule: &Arc<Rule>,
     stats: &Arc<Stats>,
@@ -42,14 +45,7 @@ pub async fn handle_forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // 读一个字节判协议，随后用 PeekStream 还回去。
-    let mut first = [0u8; 1];
-    if stream.read(&mut first).await? == 0 {
-        return Ok(()); // 客户端连上就关，正常收尾
-    }
-    let stream = PeekStream::with_byte(stream, first[0]);
-
-    if first[0] == 0x05 {
+    if stream.peeked() == Some(0x05) {
         handle_socks5(stream, peer_addr, rule, stats).await
     } else {
         handle_http_proxy(stream, peer_addr, rule, stats).await
@@ -71,6 +67,11 @@ impl<S> PeekStream<S> {
             inner,
             peeked: Some(byte),
         }
+    }
+
+    /// 还没被读走的那个首字节。
+    pub fn peeked(&self) -> Option<u8> {
+        self.peeked
     }
 }
 
@@ -119,6 +120,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeekStream<S> {
 
 // ─────────────── HTTP 代理 ───────────────
 
+/// CONNECT 已拨通上游、等 hyper 把客户端连接交出来的隧道。
+struct Tunnel {
+    upgrade: hyper::upgrade::OnUpgrade,
+    conn: UpstreamConn,
+    target: String,
+}
+
+/// 服务函数与连接任务之间交接隧道的槽位。一条连接升级之后就不再有下一个请求，
+/// 所以至多装一条。
+type TunnelSlot = Arc<Mutex<Option<Tunnel>>>;
+
 async fn handle_http_proxy<S>(
     stream: S,
     peer_addr: SocketAddr,
@@ -128,20 +140,34 @@ async fn handle_http_proxy<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let rule = Arc::clone(rule);
-    let stats = Arc::clone(stats);
+    let slot = TunnelSlot::default();
+    let service = {
+        let rule = Arc::clone(rule);
+        let stats = Arc::clone(stats);
+        let slot = Arc::clone(&slot);
+        service_fn(move |req: Request<Incoming>| {
+            let rule = Arc::clone(&rule);
+            let stats = Arc::clone(&stats);
+            let slot = Arc::clone(&slot);
+            async move { serve_http_proxy(req, peer_addr, rule, stats, slot).await }
+        })
+    };
 
     hyper::server::conn::http1::Builder::new()
-        .serve_connection(
-            TokioIo::new(stream),
-            service_fn(move |req: Request<Incoming>| {
-                let rule = Arc::clone(&rule);
-                let stats = Arc::clone(&stats);
-                async move { serve_http_proxy(req, peer_addr, rule, stats).await }
-            }),
-        )
+        .timer(TokioTimer::new())
+        .header_read_timeout(HANDSHAKE_TIMEOUT)
+        .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await?;
+
+    // CONNECT 升级后，隧道就在这条连接自己的任务里接着跑，而不是另起任务：
+    // 连接的结算（活跃数减一、线路字节入账）在本函数返回之后才做，隧道若跑在
+    // 别处，结算就发生在隧道还开着的时候——活跃数提前归零，隧道流量只能另记一笔，
+    // 遇上 RST 还会整段丢失。
+    let tunnel = slot.lock().take();
+    if let Some(tunnel) = tunnel {
+        run_tunnel(tunnel, &rule.id, stats).await;
+    }
     Ok(())
 }
 
@@ -150,6 +176,7 @@ async fn serve_http_proxy(
     peer_addr: SocketAddr,
     rule: Arc<Rule>,
     stats: Arc<Stats>,
+    slot: TunnelSlot,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     // ── 代理认证 ──
     let credential = req
@@ -175,18 +202,22 @@ async fn serve_http_proxy(
     }
 
     if req.method() == Method::CONNECT {
-        Ok(handle_connect(req, peer_addr, rule, stats).await)
+        Ok(handle_connect(req, peer_addr, rule, stats, slot).await)
     } else {
         Ok(handle_absolute_form(req, rule, stats).await)
     }
 }
 
 /// CONNECT 隧道。先拨通上游再回 200，避免客户端在一个注定失败的隧道里发数据。
+///
+/// 隧道本身不在这里跑：200 发出去之前 hyper 不会交出连接，所以把拨通的上游
+/// 留在 `slot` 里，由连接任务在 hyper 收尾后接手（见 [`handle_http_proxy`]）。
 async fn handle_connect(
     mut req: Request<Incoming>,
     peer_addr: SocketAddr,
     rule: Arc<Rule>,
     stats: Arc<Stats>,
+    slot: TunnelSlot,
 ) -> Response<ProxyBody> {
     let Some((host, port)) = req
         .uri()
@@ -197,7 +228,7 @@ async fn handle_connect(
         return text_response(StatusCode::BAD_REQUEST, "Bad CONNECT target");
     };
 
-    let target = format!("{host}:{port}");
+    let target = crate::config::join_host_port(&host, port);
     let conn = match upstream::dial(&rule.upstream, &host, port).await {
         Ok(c) => c,
         Err(e) => {
@@ -216,39 +247,48 @@ async fn handle_connect(
         )
     );
 
-    let upgrade = hyper::upgrade::on(&mut req);
-    tokio::spawn(async move {
-        match upgrade.await {
-            Ok(upgraded) => {
-                let mut client = TokioIo::new(upgraded);
-                let mut conn = conn;
-                let start = Instant::now();
-                let (up, down) = copy_both(&mut client, &mut conn).await;
-                // CountingStream 在 hyper 升级后不再覆盖隧道字节，
-                // 需要在此单独累加，否则隧道流量不进统计。
-                stats.add_bytes(up, down);
-                tracing::info!(
-                    rule_id = %rule.id,
-                    "{}",
-                    crate::i18n::tr_args(
-                        "log.tunnel_close",
-                        &[
-                            ("up", &format_bytes(up)),
-                            ("down", &format_bytes(down)),
-                            ("dur", &format_duration(start.elapsed())),
-                        ],
-                    )
-                );
-            }
-            Err(e) => {
-                stats.error();
-                tracing::debug!(rule_id = %rule.id, "CONNECT upgrade failed: {e}");
-            }
-        }
+    *slot.lock() = Some(Tunnel {
+        upgrade: hyper::upgrade::on(&mut req),
+        conn,
+        target,
     });
 
     // 200 的响应体必须为空，其后的字节属于隧道。
     Response::new(empty_body())
+}
+
+/// 等 hyper 交出客户端连接，然后双向转发到隧道关闭。
+///
+/// 隧道里的字节不在这里入账：升级后的连接底下仍是监听器包的那层计数流，
+/// 连接结算时一并算上，这里再记就重复了。
+async fn run_tunnel(tunnel: Tunnel, rule_id: &str, stats: &Stats) {
+    let upgraded = match tunnel.upgrade.await {
+        Ok(upgraded) => upgraded,
+        Err(e) => {
+            stats.error();
+            tracing::debug!(
+                rule_id = %rule_id,
+                "CONNECT upgrade failed for {}: {e}",
+                tunnel.target
+            );
+            return;
+        }
+    };
+
+    let start = Instant::now();
+    let (up, down) = copy_both(&mut TokioIo::new(upgraded), tunnel.conn).await;
+    tracing::info!(
+        rule_id = %rule_id,
+        "{}",
+        crate::i18n::tr_args(
+            "log.tunnel_close",
+            &[
+                ("up", &format_bytes(up)),
+                ("down", &format_bytes(down)),
+                ("dur", &format_duration(start.elapsed())),
+            ],
+        )
+    );
 }
 
 /// 绝对形式请求（`GET http://host/path HTTP/1.1`）：改写成 origin-form 转给上游。
@@ -265,7 +305,13 @@ async fn handle_absolute_form(
 
     let use_tls = uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https"));
     let default_port = if use_tls { 443 } else { 80 };
-    let host = authority.host().to_owned();
+    // `Authority::host()` 给 IPv6 字面量留着方括号（`[::1]`），那是 URL 的语法；
+    // 拨号、SNI 与 `host_header` 要的都是裸地址。
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
     let port = authority.port_u16().unwrap_or(default_port);
     let path = uri
         .path_and_query()
@@ -315,7 +361,11 @@ async fn handle_absolute_form(
         }
         Err(e) => {
             stats.error();
-            tracing::warn!(rule_id = %rule.id, "upstream request failed for {host}:{port}: {e}");
+            tracing::warn!(
+                rule_id = %rule.id,
+                "upstream request failed for {}: {e}",
+                crate::config::join_host_port(&host, port)
+            );
             text_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
         }
     }
@@ -333,6 +383,65 @@ async fn handle_socks5<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // 协商限时，拨号与隧道不限：前者由客户端掌控节奏，拖着不说完就一直占着连接。
+    let (host, port) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        socks5_negotiate(&mut stream, peer_addr, rule, stats),
+    )
+    .await
+    .map_err(|_| BoxError::from(format!("SOCKS5 negotiation with {peer_addr} timed out")))??;
+
+    // ── 阶段 4：拨号后再回应答 ──
+    let target = crate::config::join_host_port(&host, port);
+    let conn = match upstream::dial(&rule.upstream, &host, port).await {
+        Ok(c) => c,
+        Err(e) => {
+            stats.error();
+            socks5_reply(&mut stream, 0x05).await?; // connection refused
+            shutdown_after_reply(&mut stream).await;
+            return Err(format!("upstream dial failed for {target}: {e}").into());
+        }
+    };
+    socks5_reply(&mut stream, 0x00).await?;
+
+    tracing::info!(
+        rule_id = %rule.id,
+        "{}",
+        crate::i18n::tr_args(
+            "log.conn_open",
+            &[("peer", &peer_addr.to_string()), ("target", &target)]
+        )
+    );
+
+    let start = Instant::now();
+    let (up, down) = copy_both(&mut stream, conn).await;
+    tracing::info!(
+        rule_id = %rule.id,
+        "{}",
+        crate::i18n::tr_args(
+            "log.tunnel_close",
+            &[
+                ("up", &format_bytes(up)),
+                ("down", &format_bytes(down)),
+                ("dur", &format_duration(start.elapsed())),
+            ],
+        )
+    );
+    Ok(())
+}
+
+/// SOCKS5 协商：方法选择、用户名密码子协商、CONNECT 请求，返回客户端要连的目标。
+///
+/// 协商失败时已经回过拒绝应答并关闭了写方向，调用方只需收尾。
+async fn socks5_negotiate<S>(
+    stream: &mut S,
+    peer_addr: SocketAddr,
+    rule: &Rule,
+    stats: &Stats,
+) -> Result<(String, u16), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // ── 阶段 1：方法协商 ──
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).await?;
@@ -346,7 +455,7 @@ where
     let wanted = if credentials.is_some() { 0x02 } else { 0x00 };
     if !methods.contains(&wanted) {
         stream.write_all(&[0x05, 0xFF]).await?;
-        shutdown_after_reply(&mut stream).await;
+        shutdown_after_reply(stream).await;
         return Err(format!("no acceptable SOCKS5 auth method from {peer_addr}").into());
     }
     stream.write_all(&[0x05, wanted]).await?;
@@ -376,7 +485,7 @@ where
                 crate::i18n::tr_args("log.auth_failed", &[("peer", &peer_addr.to_string())])
             );
             stream.write_all(&[0x01, 0x01]).await?;
-            shutdown_after_reply(&mut stream).await;
+            shutdown_after_reply(stream).await;
             return Err(format!("SOCKS5 auth failed from {peer_addr}").into());
         }
         stream.write_all(&[0x01, 0x00]).await?;
@@ -393,7 +502,7 @@ where
         0x01 => {
             let mut octets = [0u8; 4];
             stream.read_exact(&mut octets).await?;
-            (std::net::Ipv4Addr::from(octets).to_string(), read_port(&mut stream).await?)
+            (std::net::Ipv4Addr::from(octets).to_string(), read_port(stream).await?)
         }
         0x03 => {
             let mut len = [0u8; 1];
@@ -402,18 +511,18 @@ where
             stream.read_exact(&mut name).await?;
             (
                 String::from_utf8_lossy(&name).into_owned(),
-                read_port(&mut stream).await?,
+                read_port(stream).await?,
             )
         }
         0x04 => {
             let mut octets = [0u8; 16];
             stream.read_exact(&mut octets).await?;
-            (std::net::Ipv6Addr::from(octets).to_string(), read_port(&mut stream).await?)
+            (std::net::Ipv6Addr::from(octets).to_string(), read_port(stream).await?)
         }
         atyp => {
             // 地址长度取决于 atyp，认不出来就无从跳过后续字节，只能连同应答一起收摊。
-            socks5_reply(&mut stream, 0x08).await?; // address type not supported
-            shutdown_after_reply(&mut stream).await;
+            socks5_reply(stream, 0x08).await?; // address type not supported
+            shutdown_after_reply(stream).await;
             return Err(format!("unsupported SOCKS5 atyp 0x{atyp:02x}").into());
         }
     };
@@ -424,48 +533,12 @@ where
     // 缓冲里还压着没读走的地址字节，Windows 会以 RST 收尾（Linux 同样如此），
     // 客户端连同应答一起丢掉，只看到"连接被重置"。读完整条请求再答，才能正常 FIN。
     if req[1] != 0x01 {
-        socks5_reply(&mut stream, 0x07).await?; // command not supported
-        shutdown_after_reply(&mut stream).await;
+        socks5_reply(stream, 0x07).await?; // command not supported
+        shutdown_after_reply(stream).await;
         return Err(format!("unsupported SOCKS5 cmd 0x{:02x} from {peer_addr}", req[1]).into());
     }
 
-    // ── 阶段 4：拨号后再回应答 ──
-    let target = format!("{host}:{port}");
-    let mut conn = match upstream::dial(&rule.upstream, &host, port).await {
-        Ok(c) => c,
-        Err(e) => {
-            stats.error();
-            socks5_reply(&mut stream, 0x05).await?; // connection refused
-            shutdown_after_reply(&mut stream).await;
-            return Err(format!("upstream dial failed for {target}: {e}").into());
-        }
-    };
-    socks5_reply(&mut stream, 0x00).await?;
-
-    tracing::info!(
-        rule_id = %rule.id,
-        "{}",
-        crate::i18n::tr_args(
-            "log.conn_open",
-            &[("peer", &peer_addr.to_string()), ("target", &target)]
-        )
-    );
-
-    let start = Instant::now();
-    let (up, down) = copy_both(&mut stream, &mut conn).await;
-    tracing::info!(
-        rule_id = %rule.id,
-        "{}",
-        crate::i18n::tr_args(
-            "log.tunnel_close",
-            &[
-                ("up", &format_bytes(up)),
-                ("down", &format_bytes(down)),
-                ("dur", &format_duration(start.elapsed())),
-            ],
-        )
-    );
-    Ok(())
+    Ok((host, port))
 }
 
 /// 写完拒绝应答后优雅收尾：先刷缓冲，再关闭写方向发出 FIN。
@@ -501,14 +574,22 @@ where
 
 // ─────────────── 辅助 ───────────────
 
-/// 双向复制，返回 `(上行, 下行)`。
-/// 出错时返回 `(0, 0)`——`copy_bidirectional` 不暴露部分计数，隧道按正常关闭处理。
-async fn copy_both<A, B>(a: &mut A, b: &mut B) -> (u64, u64)
+/// 双向复制到任一端关闭，返回 `(上行, 下行)`：客户端→上游、上游→客户端各送出多少字节。
+///
+/// 隧道以错误收场（多半是某一端被重置）时也返回已经送出的部分。`copy_bidirectional`
+/// 出错时不给计数，所以在上游那一侧套一层计数流自己记。
+async fn copy_both<A, B>(client: &mut A, upstream: B) -> (u64, u64)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional(a, b).await.unwrap_or_default()
+    let counters = ByteCounters::new();
+    let mut upstream = CountingStream::new(upstream, counters.clone());
+    let _ = tokio::io::copy_bidirectional(client, &mut upstream).await;
+    // 计数流的「上/下」是站在被包的那一端说的：从上游读出的是隧道的下行，
+    // 写进上游的才是上行，这里要对调。
+    let (from_upstream, to_upstream) = counters.get();
+    (to_upstream, from_upstream)
 }
 
 fn parse_authority(authority: &str) -> Option<(String, u16)> {

@@ -18,6 +18,8 @@ fn main() {
                 "qml/LogView.qml",
                 "qml/Tray.qml",
                 "qml/ConfirmDialog.qml",
+                // 依赖 QtQuick.Dialogs，由设置页经 Loader 装载，缺这个模块时只少一个按钮。
+                "qml/ConfigFileDialog.qml",
                 "qml/FieldRow.qml",
                 // 控件基元：Basic 样式的默认外观是浅色的，按钮、输入框、
                 // 复选框、下拉框都得整块换掉，换一次这里存一份。

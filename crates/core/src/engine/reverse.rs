@@ -22,7 +22,7 @@ use std::time::Instant;
 use http::{Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::Rule;
@@ -31,6 +31,7 @@ use crate::engine::forward::format_duration;
 use crate::engine::http_relay::{
     self, relay_response, send_upstream, text_response, BoxError, ProxyBody,
 };
+use crate::engine::listener::HANDSHAKE_TIMEOUT;
 use crate::status::Stats;
 
 // ─────────────── 公开入口 ───────────────
@@ -48,7 +49,10 @@ where
     let rule = Arc::clone(rule);
     let stats = Arc::clone(stats);
 
+    // 不设 timer 的话 hyper 默认的请求头超时不生效，慢吞吞发头的连接会一直挂着。
     hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HANDSHAKE_TIMEOUT)
         .serve_connection(
             TokioIo::new(stream),
             service_fn(move |req: Request<Incoming>| {

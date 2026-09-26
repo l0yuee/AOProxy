@@ -20,7 +20,9 @@ ApplicationWindow {
     height: 640
     minimumWidth: 720
     minimumHeight: 480
-    visible: true
+    // 先不显示，由 initialShow() 决定：开机自启时窗口应当待在托盘里，
+    // 先显示再隐藏会在登录时闪一下。
+    visible: false
     // 标题带版本号：任务栏悬停与 alt-tab 都只看得到这一行，
     // 出问题时让人报版本比让人去翻「关于」省事。
     title: t("app.name") + " " + bridge.version
@@ -40,6 +42,8 @@ ApplicationWindow {
         // 规则的运行态变了就让模型重取一遍：流量与连接数也在同一份快照里。
         onStatusChanged: ruleModel.refresh()
         onLanguageChanged: ruleModel.refresh()
+        // 换了配置文件，规则整批换了。设置页自己也接这个信号重读各项。
+        onConfigChanged: ruleModel.refresh()
         onShowRequested: root.wakeUp()
         // stop_all 收尾完才到这里。先放行关闭再请求退出：Qt 6 的 quit() 会先逐个
         // close 顶层窗口，任何一个拒绝就整个作废。下面的 onClosing 若照旧拦下，
@@ -64,7 +68,7 @@ ApplicationWindow {
     // 可能没装）直接写 `Tray {}` 会让整个 main.qml 连带加载失败——release 是
     // windows 子系统没有控制台，表现就是进程起来了却什么都不显示，且无处报错。
     // 装进 Loader 后这类失败降级成 status === Loader.Error：窗口照常出现，
-    // trayAvailable 保持 false，关窗按退出处理，只是没有托盘。
+    // trayAvailable 置为 false，关窗按退出处理，只是没有托盘。
     //
     // 用 setSource 而不是 source 属性：bridge 必须在组件完成之前就位，
     // Tray.qml 的 Component.onCompleted 要靠它回填 trayAvailable。
@@ -81,9 +85,14 @@ ApplicationWindow {
         // qmlcachegen 把 QML 里的字面量原样写进 UTF-8 的 .cpp，而 cl.exe 按本机代码页
         // （中文 Windows 是 936）读它，多字节序列会把收尾的引号吃掉 —— 报 C2001 加 C1057。
         // QML 里所有给用户看的文案都经 bridge.tr()，中文只留在注释里。
+        //
+        // trayAvailable 的初值只是按平台猜的（Windows 上恒为 true），托盘装不上时必须
+        // 在这里改掉，否则关窗照样缩进一个并不存在的托盘，窗口从此叫不回来。
         onStatusChanged: {
-            if (status === Loader.Error)
+            if (status === Loader.Error) {
                 console.warn("Tray.qml failed to load; tray disabled (Qt.labs.platform missing?)")
+                bridge.trayAvailable = false
+            }
         }
     }
 
@@ -446,9 +455,24 @@ ApplicationWindow {
         }
     }
 
-    // 托盘缺失只提醒一次，且只在「关闭即缩到托盘」真的失效时才有意义。
+    /// 首次露面。开机自启拉起来时待在托盘里；没有托盘（或关掉了缩到托盘）就最小化到
+    /// 任务栏——总之别在登录时把窗口甩到用户面前。平常启动照常显示。
+    function initialShow() {
+        if (!bridge.launchedAtLogin)
+            root.show()
+        else if (!root.wantsTray())
+            root.showMinimized()
+    }
+
     Component.onCompleted: {
+        // 托盘缺失只提醒一次，且只在「关闭即缩到托盘」真的失效时才有意义。
         if (!bridge.trayAvailable)
             console.warn(root.t("gui.tray_missing"))
+        // 托盘到底能不能用，要等 Tray.qml 装完回填 trayAvailable 才知道，而各个
+        // onCompleted 的先后没有保证：推到本轮事件处理的末尾再决定显示与否。
+        Qt.callLater(root.initialShow)
+        // 开机自启的意义在于登录后代理就在跑，不必再手动点「全部启用」。
+        if (bridge.launchedAtLogin)
+            bridge.startAll()
     }
 }

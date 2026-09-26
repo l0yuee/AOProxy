@@ -5,6 +5,7 @@
 //! 一条[`Rule`]描述一个完整的转发链路：入站监听 + 转发模式 + 出站通道。
 //! 多条规则由[`Engine`]并行驱动，彼此独立启停，互不影响。
 
+pub mod autostart;
 pub mod config;
 pub mod engine;
 pub mod error;
