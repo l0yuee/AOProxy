@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use cxx_qt_lib::{QString, QUrl};
 
-use aoproxy_core::{autostart, config, i18n, AppConfig, Config, Engine, Error, LogLevel, RuleStatus};
+use aoproxy_core::{
+    autostart, config, i18n, AppConfig, Config, Engine, Error, Language, LogLevel, RuleStatus,
+};
 
 use super::rule_model::status_tag;
 use super::shared;
@@ -49,6 +51,8 @@ pub struct AppBridgeState {
     /// 做成带变更信号的属性，一边改了另一边的勾选状态跟着变。
     logging_enabled: bool,
     log_level: QString,
+    /// 推测出的系统语言标签，设置页「跟随系统」那一项括号里显示它。
+    system_language: QString,
 }
 
 impl Default for AppBridgeState {
@@ -75,6 +79,7 @@ impl Default for AppBridgeState {
             launched_at_login: launch.is_some_and(|l| l.launched_at_login),
             logging_enabled: current_app().logging_enabled,
             log_level: QString::from(current_app().log_level.to_string().as_str()),
+            system_language: QString::from(Language::detect().tag()),
         }
     }
 }
@@ -117,6 +122,8 @@ pub mod qobject {
         /// 改用 `enableLogging` / `selectLogLevel`，直接赋值不会落盘。
         #[qproperty(bool, logging_enabled, cxx_name = "loggingEnabled")]
         #[qproperty(QString, log_level, cxx_name = "logLevel")]
+        /// 推测出的系统语言（`zh-CN` 或 `en-US`），只读。
+        #[qproperty(QString, system_language, cxx_name = "systemLanguage")]
         type AppBridge = super::AppBridgeState;
 
         /// 规则状态发生变化（启动/停止/失败）时发出，QML 监听后刷新列表。

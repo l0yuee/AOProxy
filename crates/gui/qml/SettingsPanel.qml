@@ -18,8 +18,12 @@ Item {
 
     /// 读取期间屏蔽回写，否则 currentIndex 一被赋值就会把旧值存回去。
     property bool loading: true
+    /// 语言下拉框的取值：第一项 "" 是「跟随系统」，其余是语言标签，与 langNames 一一对应。
     property var langTags: []
     property var langNames: []
+    /// 系统语言的本族名。「跟随系统」那一项在括号里显示它，选了之后下拉框上仍看得出
+    /// 界面实际用的是什么语言。
+    property string systemLanguageName: ""
     /// 用户选定的界面语言标签；null 表示没选过、跟随系统。存设置时原样带上：
     /// 改日志开关之类的其他项时，不能顺手把眼下（按系统推测出的）语言记成用户的选择，
     /// 否则系统语言再变，界面也不跟了。
@@ -32,21 +36,30 @@ Item {
     Theme { id: theme }
 
     function t(key) { return bridge ? (bridge.language, bridge.tr(key)) : "" }
+    function tf(key, args) {
+        return bridge ? (bridge.language, bridge.trFmt(key, JSON.stringify(args))) : ""
+    }
+
+    /// 下拉框该选中哪一项：没选过语言就是「跟随系统」。
+    function languageIndex() {
+        return Math.max(0, langTags.indexOf(chosenLanguage || ""))
+    }
 
     function load() {
         loading = true
         var items = JSON.parse(bridge.languageList())
-        var tags = [], names = []
+        var tags = [""], names = []
         for (var i = 0; i < items.length; i++) {
             tags.push(items[i].tag)
             names.push(items[i].name)
+            if (items[i].tag === bridge.systemLanguage)
+                systemLanguageName = items[i].name
         }
         langTags = tags
         langNames = names
         var cfg = JSON.parse(bridge.appConfigJson())
         chosenLanguage = cfg.language || null
-        // 下拉框显示界面实际在用的语言：没选过时就是系统语言。
-        langBox.currentIndex = Math.max(0, tags.indexOf(bridge.language))
+        langBox.currentIndex = languageIndex()
         logBox.checked = cfg.logging_enabled === true
         levelBox.currentIndex = Math.max(0, levels.indexOf(cfg.log_level || "info"))
         trayBox.checked = cfg.minimize_to_tray !== false
@@ -90,10 +103,8 @@ Item {
         // 托盘菜单也能开关日志、改级别，这里跟着 bridge 的属性走。
         // 两个控件只在用户操作时回写（onToggled / onActivated），这样赋值不会绕回去。
         function onLoggingEnabledChanged() { logBox.checked = root.bridge.loggingEnabled }
-        // 下拉框始终与界面实际用的语言一致，不管语言是从哪儿变的。
-        function onLanguageChanged() {
-            langBox.currentIndex = Math.max(0, root.langTags.indexOf(root.bridge.language))
-        }
+        // 选中项始终是当前的语言设置（「跟随系统」那一项括号里写着实际用的语言）。
+        function onLanguageChanged() { langBox.currentIndex = root.languageIndex() }
         function onLogLevelChanged() {
             levelBox.currentIndex = Math.max(0, root.levels.indexOf(root.bridge.logLevel))
         }
@@ -138,13 +149,16 @@ Item {
                 Layout.fillWidth: true
                 Dropdown {
                     id: langBox
-                    // 语言项显示各自的本族名，界面语言看不懂时也能找到自己那一项，
-                    // 所以这里不需要 labels。
-                    model: root.langNames
-                    Layout.preferredWidth: 190
-                    // 只有在这里亲手选了，语言才算用户的设置。
+                    // 取值是语言标签，显示的是 labels：语言项用各自的本族名，界面语言看不懂时
+                    // 也能找到自己那一项；「跟随系统」随界面语言翻译，括号里是系统语言的本族名。
+                    model: root.langTags
+                    labels: [root.tf("gui.language_system", { name: root.systemLanguageName })]
+                            .concat(root.langNames)
+                    Layout.preferredWidth: 230
+                    // 只有在这里亲手选了，语言才算用户的设置；选「跟随系统」就把设置清掉，
+                    // 配置里的 language 随之删去，此后跟着系统语言走。
                     onActivated: {
-                        root.chosenLanguage = root.langTags[langBox.currentIndex]
+                        root.chosenLanguage = root.langTags[langBox.currentIndex] || null
                         root.apply()
                     }
                 }
