@@ -387,7 +387,7 @@ ApplicationWindow {
                         listen:      model.display_listen ?? ""
                         detail:      model.display_detail ?? ""
                         status:      model.display_status ?? "stopped"
-                        ruleEnabled: model.display_enabled ?? true
+                        ruleEnabled: model.display_enabled ?? false
                         trafficUp:   model.display_bytes_up ?? "0 B"
                         trafficDown: model.display_bytes_down ?? "0 B"
                         connections: model.display_connections ?? 0

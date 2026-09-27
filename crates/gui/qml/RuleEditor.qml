@@ -46,7 +46,7 @@ Dialog {
         var r = JSON.parse(bridge.ruleJson(id))
         nameField.text = r.name || ""
         idField.text = id
-        enabledBox.checked = r.enabled !== false
+        enabledBox.checked = r.enabled === true
         modeBox.currentIndex = Math.max(0, modeTags.indexOf(r.mode || "reverse"))
         // listen 是 "host:port"，从最后一个冒号切，IPv6 的 "[::1]:8080" 也对。
         var listen = r.listen || ""

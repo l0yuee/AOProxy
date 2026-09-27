@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use cxx_qt_lib::{QString, QUrl};
 
-use aoproxy_core::{autostart, config, i18n, Config, Engine, Error};
+use aoproxy_core::{autostart, config, i18n, AppConfig, Config, Engine, Error, LogLevel, RuleStatus};
 
+use super::rule_model::status_tag;
 use super::shared;
 
 // ─────────────────────── Rust 状态 ───────────────────────
@@ -44,6 +45,10 @@ pub struct AppBridgeState {
     autostart_supported: bool,
     /// 这次是开机自启拉起来的：界面缩在托盘里，并运行已启用的规则。
     launched_at_login: bool,
+    /// 日志开关与级别的属性镜像。托盘菜单和设置页都能改这两项，
+    /// 做成带变更信号的属性，一边改了另一边的勾选状态跟着变。
+    logging_enabled: bool,
+    log_level: QString,
 }
 
 impl Default for AppBridgeState {
@@ -68,6 +73,8 @@ impl Default for AppBridgeState {
             version: QString::from(aoproxy_core::VERSION),
             autostart_supported: autostart::is_supported(),
             launched_at_login: launch.is_some_and(|l| l.launched_at_login),
+            logging_enabled: current_app().logging_enabled,
+            log_level: QString::from(current_app().log_level.to_string().as_str()),
         }
     }
 }
@@ -106,6 +113,10 @@ pub mod qobject {
         #[qproperty(QString, version)]
         #[qproperty(bool, autostart_supported, cxx_name = "autostartSupported")]
         #[qproperty(bool, launched_at_login, cxx_name = "launchedAtLogin")]
+        /// 日志是否开启、日志级别（`error` … `trace`），只读镜像：
+        /// 改用 `enableLogging` / `selectLogLevel`，直接赋值不会落盘。
+        #[qproperty(bool, logging_enabled, cxx_name = "loggingEnabled")]
+        #[qproperty(QString, log_level, cxx_name = "logLevel")]
         type AppBridge = super::AppBridgeState;
 
         /// 规则状态发生变化（启动/停止/失败）时发出，QML 监听后刷新列表。
@@ -176,6 +187,22 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "saveAppConfig"]
         fn save_app_config(self: Pin<&mut AppBridge>, json: &QString);
+
+        /// 打开或关闭日志，即时生效并落盘。托盘菜单用。
+        #[qinvokable]
+        #[cxx_name = "enableLogging"]
+        fn enable_logging(self: Pin<&mut AppBridge>, enabled: bool);
+
+        /// 改日志级别（`error` | `warn` | `info` | `debug` | `trace`），即时生效并落盘。托盘菜单用。
+        #[qinvokable]
+        #[cxx_name = "selectLogLevel"]
+        fn select_log_level(self: Pin<&mut AppBridge>, level: &QString);
+
+        /// 托盘菜单里的规则列表，JSON 数组，按配置顺序，元素为
+        /// `{id, name, enabled, status}`；`status` 取值同规则列表（`running` 等）。
+        #[qinvokable]
+        #[cxx_name = "ruleMenuJson"]
+        fn rule_menu_json(self: &AppBridge) -> QString;
 
         /// 换用另一个配置文件：文件已存在就载入它，不存在就把当前配置存过去；
         /// 并记下这个位置，下次启动（GUI 与 CLI）照旧用它。填的就是当前文件时，
@@ -365,40 +392,60 @@ impl qobject::AppBridge {
     }
 
     fn app_config_json(&self) -> QString {
-        let app = shared::engine().map(|e| e.config().app).unwrap_or_else(|| {
-            // 没有引擎（配置没读出来）时，至少让语言与界面上正在用的一致。
-            aoproxy_core::AppConfig {
-                language: i18n::language(),
-                ..Default::default()
-            }
-        });
-        QString::from(serde_json::to_string(&app).unwrap_or_default().as_str())
+        QString::from(serde_json::to_string(&current_app()).unwrap_or_default().as_str())
     }
 
-    /// 应用全局设置。语言、日志开关与级别由核心即时生效，
-    /// 随后发 `languageChanged` 让 QML 重新求值所有 `tr()` 绑定。
-    fn save_app_config(mut self: Pin<&mut Self>, json: &QString) {
-        let text = json.to_string();
-        let app = match serde_json::from_str::<aoproxy_core::AppConfig>(&text) {
-            Ok(a) => a,
-            Err(e) => {
-                self.report_text(form_error(&e));
-                return;
-            }
+    /// 应用全局设置（设置页整份发来）。
+    fn save_app_config(self: Pin<&mut Self>, json: &QString) {
+        match serde_json::from_str::<AppConfig>(&json.to_string()) {
+            Ok(app) => self.apply_app(app),
+            Err(e) => self.report_text(form_error(&e)),
+        }
+    }
+
+    fn enable_logging(self: Pin<&mut Self>, enabled: bool) {
+        let app = AppConfig {
+            logging_enabled: enabled,
+            ..current_app()
         };
-        let result = match shared::engine() {
-            Some(engine) => engine.update_app_config(app),
-            // 配置没读出来，存不了盘；至少让语言与日志开关当场生效。
-            None => {
-                i18n::set_language(app.language);
-                aoproxy_core::log::set_logging_enabled(app.logging_enabled);
-                aoproxy_core::log::set_level(app.log_level);
-                Ok(())
+        self.apply_app(app);
+    }
+
+    fn select_log_level(self: Pin<&mut Self>, level: &QString) {
+        // 级别名与配置文件里的写法相同，按同一套反序列化规则解析。
+        let level = serde_json::Value::String(level.to_string());
+        match serde_json::from_value::<LogLevel>(level) {
+            Ok(log_level) => {
+                let app = AppConfig {
+                    log_level,
+                    ..current_app()
+                };
+                self.apply_app(app);
             }
-        };
-        self.as_mut().report(result);
-        self.as_mut().sync_language();
-        self.status_changed();
+            Err(e) => self.report_text(form_error(&e)),
+        }
+    }
+
+    fn rule_menu_json(&self) -> QString {
+        let items: Vec<_> = shared::engine()
+            .map(|engine| {
+                engine
+                    .config()
+                    .rules
+                    .iter()
+                    .map(|rule| {
+                        let status = engine.rule_status(&rule.id).unwrap_or(RuleStatus::Stopped);
+                        serde_json::json!({
+                            "id": rule.id,
+                            "name": rule.name,
+                            "enabled": rule.enabled,
+                            "status": status_tag(&status),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        QString::from(serde_json::to_string(&items).unwrap_or_default().as_str())
     }
 
     fn apply_config_path(self: Pin<&mut Self>, path: &QString) -> QString {
@@ -437,7 +484,7 @@ impl qobject::AppBridge {
                 .queue(move |mut bridge| {
                     bridge.as_mut().set_config_path(path_qstring(&path));
                     bridge.as_mut().report_text(String::new());
-                    bridge.as_mut().sync_language();
+                    bridge.as_mut().sync_app_state();
                     bridge.as_mut().refresh_running_count();
                     bridge.as_mut().config_changed();
                     bridge.status_changed();
@@ -618,14 +665,53 @@ impl qobject::AppBridge {
         self.set_running_count(count);
     }
 
-    /// 界面语言可能刚变过（改了设置、换了配置文件）：更新 `language` 属性并发信号。
-    /// 属性变化会让 QML 里所有经辅助函数取的文案重算，信号则供需要手动刷新的
-    /// 地方（如托盘菜单）使用。
-    fn sync_language(mut self: Pin<&mut Self>) {
+    /// 应用全局设置：语言、日志开关与级别由核心即时生效并落盘，随后同步各属性。
+    ///
+    /// 设置页与托盘菜单都走这里：两边改的是同一份设置，属性一变另一边就跟着变。
+    fn apply_app(mut self: Pin<&mut Self>, app: AppConfig) {
+        let result = match shared::engine() {
+            Some(engine) => engine.update_app_config(app),
+            // 配置没读出来，存不了盘；至少让语言与日志开关当场生效。
+            None => {
+                i18n::set_language(app.effective_language());
+                aoproxy_core::log::set_logging_enabled(app.logging_enabled);
+                aoproxy_core::log::set_level(app.log_level);
+                Ok(())
+            }
+        };
+        self.as_mut().report(result);
+        self.as_mut().sync_app_state();
+        self.status_changed();
+    }
+
+    /// 应用设置可能刚变过（改了设置、换了配置文件）：把属性镜像对齐到当前值。
+    ///
+    /// 语言那一项总是重发 `languageChanged`：属性变化会让 QML 里所有经辅助函数取的
+    /// 文案重算，信号则供需要手动刷新的地方（如托盘菜单）使用。日志两项由属性的
+    /// setter 在值真的变了时才发信号。
+    fn sync_app_state(mut self: Pin<&mut Self>) {
+        let app = current_app();
+        self.as_mut().set_logging_enabled(app.logging_enabled);
+        self.as_mut()
+            .set_log_level(QString::from(app.log_level.to_string().as_str()));
         let tag = QString::from(i18n::language().tag());
         self.as_mut().set_language(tag);
         self.language_changed();
     }
+}
+
+/// 当前的应用设置。没有引擎（配置没读出来）时存不了盘，就取本进程正在用的语言与
+/// 日志设置：否则托盘里刚打开的日志一读回来又成了关、刚选的语言又被换回系统语言。
+fn current_app() -> AppConfig {
+    shared::engine().map_or_else(
+        || AppConfig {
+            language: Some(i18n::language()),
+            logging_enabled: aoproxy_core::log::logging_enabled(),
+            log_level: aoproxy_core::log::level(),
+            ..Default::default()
+        },
+        |engine| engine.config().app,
+    )
 }
 
 /// 换配置文件前的准备：文件已存在就读出来，不存在就把当前配置存过去（换个地方放）。
@@ -677,15 +763,16 @@ fn form_error(e: &serde_json::Error) -> String {
     i18n::tr_args("gui.form_invalid", &[("reason", &e.to_string())])
 }
 
-/// 新建规则的默认值：监听回环、反向模式、直连出网。
+/// 新建规则的默认值：未启用、监听回环、反向模式、直连出网。
 ///
 /// 回环而非 `0.0.0.0`：新规则默认只对本机开放，用户想暴露到公网得自己改，
-/// 免得一条还没配认证的规则一存下来就对外监听。
+/// 免得一条还没配认证的规则一存下来就对外监听。未启用与配置文件里不写 `enabled`
+/// 的默认一致：没被明确打开过的规则不会被「全部启用」或开机自启带起来。
 fn default_rule() -> aoproxy_core::Rule {
     aoproxy_core::Rule {
         id: String::new(),
         name: String::new(),
-        enabled: true,
+        enabled: false,
         mode: aoproxy_core::Mode::Reverse,
         listen: "127.0.0.1:8080".to_owned(),
         target: None,

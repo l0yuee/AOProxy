@@ -19,10 +19,10 @@ const EN_US_SRC: &str = include_str!("../../../assets/i18n/en-US.toml");
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Language {
     /// 简体中文
-    #[default]
     #[serde(rename = "zh-CN", alias = "zh", alias = "zh_CN")]
     ZhCn,
-    /// English
+    /// English。系统语言既不是中文也不是英文、或者推测不出来时用它。
+    #[default]
     #[serde(rename = "en-US", alias = "en", alias = "en_US")]
     EnUs,
 }
@@ -47,26 +47,27 @@ impl Language {
         }
     }
 
-    /// 解析 BCP 47 标签，无法识别时回退到简体中文。
+    /// 解析语言标签，BCP 47 的 `zh-CN`、POSIX 的 `zh_CN.UTF-8`、macOS 的 `zh-Hans-CN`
+    /// 都认。中文的各种写法（含繁体）归到简体中文，其余一律英文——只有这两份译文，
+    /// 法语、日语系统上与其给一份看不懂的中文，不如给英文。
     pub fn from_tag(tag: &str) -> Self {
-        let lower = tag.to_ascii_lowercase();
-        if lower.starts_with("en") {
-            Self::EnUs
-        } else {
+        let primary = tag.split(['-', '_', '.', '@']).next().unwrap_or_default();
+        if primary.eq_ignore_ascii_case("zh") {
             Self::ZhCn
+        } else {
+            Self::EnUs
         }
     }
 
-    /// 按环境变量推测系统语言。Windows 上这些变量通常为空，会回退到默认值。
+    /// 推测系统语言，推测不出来时用英文。同一进程里只推测一次。
+    ///
+    /// - Windows：读用户界面语言（`GetUserDefaultUILanguage`）。那里的 `LANG` 之类通常为空，
+    ///   即便有也多半来自 Git Bash 这类外壳，不代表系统。
+    /// - 其他系统：照 gettext 的规矩读环境变量，见 [`locale_from_env`]。
+    /// - macOS：从访达启动时没有这些环境变量，再读系统偏好里的 `AppleLanguages`。
     pub fn detect() -> Self {
-        for var in ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
-            if let Ok(value) = std::env::var(var) {
-                if !value.is_empty() && value != "C" && value != "POSIX" {
-                    return Self::from_tag(&value);
-                }
-            }
-        }
-        Self::default()
+        static SYSTEM: OnceLock<Language> = OnceLock::new();
+        *SYSTEM.get_or_init(|| system_language().unwrap_or_default())
     }
 
     const fn index(self) -> u8 {
@@ -90,7 +91,8 @@ impl std::fmt::Display for Language {
     }
 }
 
-static CURRENT: AtomicU8 = AtomicU8::new(0);
+/// 当前语言。初值与 [`Language::default`] 一致；CLI 与 GUI 一启动就会按系统或配置重设。
+static CURRENT: AtomicU8 = AtomicU8::new(Language::EnUs.index());
 
 /// 设定当前语言，影响此后所有[`tr`]调用。
 pub fn set_language(lang: Language) {
@@ -168,6 +170,76 @@ fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+// ─────────────── 系统语言 ───────────────
+
+#[cfg(windows)]
+fn system_language() -> Option<Language> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        /// 返回 LANGID：低 10 位是主语言，0x04 为中文（简繁都是）。
+        fn GetUserDefaultUILanguage() -> u16;
+    }
+    // SAFETY: 无参数、无副作用的查询函数。
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    Some(if langid & 0x3ff == 0x04 {
+        Language::ZhCn
+    } else {
+        Language::EnUs
+    })
+}
+
+#[cfg(not(windows))]
+fn system_language() -> Option<Language> {
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let tag = locale_from_env(env);
+    #[cfg(target_os = "macos")]
+    let tag = tag.or_else(|| {
+        let out = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+            .ok()?;
+        first_apple_language(&String::from_utf8_lossy(&out.stdout))
+    });
+    tag.map(|tag| Language::from_tag(&tag))
+}
+
+/// 按 gettext 的规矩从环境变量里取界面语言，取不到返回 `None`。
+///
+/// 区域由 `LC_ALL` > `LC_MESSAGES` > `LANG` 中第一个非空的决定。区域是 `C`/`POSIX`
+/// 时视为没有设语言（gettext 此时连 `LANGUAGE` 都不看）；否则 `LANGUAGE` 这张
+/// 优先级列表（`zh_CN:en_US`）更优先，取它的第一项。
+#[cfg(any(test, not(windows)))]
+fn locale_from_env(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(&env)?;
+    if locale == "C" || locale == "POSIX" || locale.starts_with("C.") {
+        return None;
+    }
+    let preferred = env("LANGUAGE")
+        .and_then(|list| list.split(':').find(|item| !item.is_empty()).map(str::to_owned));
+    Some(preferred.unwrap_or(locale))
+}
+
+/// 从 `defaults read -g AppleLanguages` 的输出里取第一项（首选语言）。输出形如：
+///
+/// ```text
+/// (
+///     "zh-Hans-CN",
+///     en
+/// )
+/// ```
+#[cfg(any(test, target_os = "macos"))]
+fn first_apple_language(output: &str) -> Option<String> {
+    output
+        .trim()
+        .trim_start_matches('(')
+        .split([',', '\n'])
+        .map(|item| item.trim().trim_matches('"').trim())
+        .find(|item| !item.is_empty() && *item != ")")
+        .map(str::to_owned)
 }
 
 fn catalog(lang: Language) -> &'static HashMap<String, String> {
@@ -263,5 +335,58 @@ mod tests {
         for lang in Language::ALL {
             assert_eq!(Language::from_tag(lang.tag()), lang);
         }
+    }
+
+    /// 只有中英两份译文：中文的各种写法归中文，其余（含法语、日语）一律英文。
+    #[test]
+    fn from_tag_maps_everything_else_to_english() {
+        for tag in ["zh_CN.UTF-8", "zh-Hans-CN", "zh_TW", "ZH", "zh"] {
+            assert_eq!(Language::from_tag(tag), Language::ZhCn, "{tag}");
+        }
+        for tag in ["en_US.UTF-8", "en-GB", "fr_FR.UTF-8", "ja_JP", "de", "zha", ""] {
+            assert_eq!(Language::from_tag(tag), Language::EnUs, "{tag}");
+        }
+    }
+
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, v)| *k == name && !v.is_empty())
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn env_locale_follows_gettext_precedence() {
+        // LC_ALL > LC_MESSAGES > LANG
+        let vars = [("LANG", "en_US.UTF-8"), ("LC_MESSAGES", "zh_CN.UTF-8")];
+        assert_eq!(locale_from_env(env_of(&vars)).as_deref(), Some("zh_CN.UTF-8"));
+        let vars = [("LC_ALL", "fr_FR"), ("LANG", "zh_CN")];
+        assert_eq!(locale_from_env(env_of(&vars)).as_deref(), Some("fr_FR"));
+        // 空值等于没设
+        let vars = [("LC_ALL", ""), ("LANG", "zh_CN")];
+        assert_eq!(locale_from_env(env_of(&vars)).as_deref(), Some("zh_CN"));
+        // LANGUAGE 优先于区域，取列表第一项
+        let vars = [("LANG", "en_US.UTF-8"), ("LANGUAGE", "zh_CN:en_US")];
+        assert_eq!(locale_from_env(env_of(&vars)).as_deref(), Some("zh_CN"));
+    }
+
+    /// C / POSIX 区域等于没设语言，gettext 此时连 LANGUAGE 也不看。
+    #[test]
+    fn env_locale_c_means_unset() {
+        for locale in ["C", "POSIX", "C.UTF-8"] {
+            let vars = [("LANG", locale), ("LANGUAGE", "zh_CN")];
+            assert_eq!(locale_from_env(env_of(&vars)), None, "{locale}");
+        }
+        assert_eq!(locale_from_env(env_of(&[])), None);
+    }
+
+    #[test]
+    fn apple_languages_first_entry() {
+        let out = "(\n    \"zh-Hans-CN\",\n    en\n)\n";
+        assert_eq!(first_apple_language(out).as_deref(), Some("zh-Hans-CN"));
+        assert_eq!(first_apple_language("(\n    en\n)\n").as_deref(), Some("en"));
+        assert_eq!(first_apple_language("(\n)\n"), None);
+        assert_eq!(first_apple_language(""), None);
     }
 }

@@ -20,6 +20,10 @@ Item {
     property bool loading: true
     property var langTags: []
     property var langNames: []
+    /// 用户选定的界面语言标签；null 表示没选过、跟随系统。存设置时原样带上：
+    /// 改日志开关之类的其他项时，不能顺手把眼下（按系统推测出的）语言记成用户的选择，
+    /// 否则系统语言再变，界面也不跟了。
+    property var chosenLanguage: null
     /// 配置文件那一栏的错误，空串表示没有。
     property string pathError: ""
 
@@ -40,7 +44,9 @@ Item {
         langTags = tags
         langNames = names
         var cfg = JSON.parse(bridge.appConfigJson())
-        langBox.currentIndex = Math.max(0, tags.indexOf(cfg.language))
+        chosenLanguage = cfg.language || null
+        // 下拉框显示界面实际在用的语言：没选过时就是系统语言。
+        langBox.currentIndex = Math.max(0, tags.indexOf(bridge.language))
         logBox.checked = cfg.logging_enabled === true
         levelBox.currentIndex = Math.max(0, levels.indexOf(cfg.log_level || "info"))
         trayBox.checked = cfg.minimize_to_tray !== false
@@ -55,7 +61,7 @@ Item {
     function apply() {
         if (loading || !bridge) return
         bridge.saveAppConfig(JSON.stringify({
-            language: langTags[langBox.currentIndex],
+            language: chosenLanguage,
             logging_enabled: logBox.checked,
             log_level: levels[levelBox.currentIndex],
             minimize_to_tray: trayBox.checked
@@ -81,6 +87,16 @@ Item {
         target: root.bridge
         // 换了配置文件：语言、日志、托盘这几项都随新文件变了，整页重读。
         function onConfigChanged() { root.load() }
+        // 托盘菜单也能开关日志、改级别，这里跟着 bridge 的属性走。
+        // 两个控件只在用户操作时回写（onToggled / onActivated），这样赋值不会绕回去。
+        function onLoggingEnabledChanged() { logBox.checked = root.bridge.loggingEnabled }
+        // 下拉框始终与界面实际用的语言一致，不管语言是从哪儿变的。
+        function onLanguageChanged() {
+            langBox.currentIndex = Math.max(0, root.langTags.indexOf(root.bridge.language))
+        }
+        function onLogLevelChanged() {
+            levelBox.currentIndex = Math.max(0, root.levels.indexOf(root.bridge.logLevel))
+        }
     }
 
     // 文件对话框依赖 QtQuick.Dialogs，单独成文件经 Loader 装载，理由见 ConfigFileDialog.qml。
@@ -126,7 +142,11 @@ Item {
                     // 所以这里不需要 labels。
                     model: root.langNames
                     Layout.preferredWidth: 190
-                    onActivated: root.apply()
+                    // 只有在这里亲手选了，语言才算用户的设置。
+                    onActivated: {
+                        root.chosenLanguage = root.langTags[langBox.currentIndex]
+                        root.apply()
+                    }
                 }
                 Item { Layout.fillWidth: true }
             }

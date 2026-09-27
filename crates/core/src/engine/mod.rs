@@ -462,7 +462,7 @@ impl Engine {
 
 /// 把应用设置里即时生效的几项（界面语言、日志开关与级别）应用到本进程。
 fn apply_app_settings(app: &AppConfig) {
-    crate::i18n::set_language(app.language);
+    crate::i18n::set_language(app.effective_language());
     crate::log::set_logging_enabled(app.logging_enabled);
     crate::log::set_level(app.log_level);
 }
