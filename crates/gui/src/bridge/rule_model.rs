@@ -13,6 +13,17 @@ use aoproxy_core::RuleStatus;
 
 // ─────────────────────── 行数据 ───────────────────────
 
+/// 运行状态在界面上的标签，也是词条 `state.<标签>` 的后半段。
+/// 规则列表与托盘菜单都用它，两处的说法不会对不上。
+pub(super) fn status_tag(status: &RuleStatus) -> &'static str {
+    match status {
+        RuleStatus::Stopped => "stopped",
+        RuleStatus::Starting => "starting",
+        RuleStatus::Running => "running",
+        RuleStatus::Failed(_) => "failed",
+    }
+}
+
 /// 单条规则的快照，由 Engine 状态提取。
 #[derive(Default, Clone)]
 pub struct RuleRow {
@@ -67,13 +78,7 @@ impl RuleModelState {
                 let (status, snapshot) = statuses
                     .remove(&rule.id)
                     .unwrap_or_else(|| (RuleStatus::Stopped, Default::default()));
-                let status_str = match status {
-                    RuleStatus::Stopped => "stopped",
-                    RuleStatus::Starting => "starting",
-                    RuleStatus::Running => "running",
-                    RuleStatus::Failed(_) => "failed",
-                }
-                .to_owned();
+                let status_str = status_tag(&status).to_owned();
                 RuleRow {
                     id: rule.id.clone(),
                     name: rule.name.clone(),

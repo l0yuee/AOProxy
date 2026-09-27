@@ -42,6 +42,11 @@ pub fn set_level(level: LogLevel) {
     sync_filter();
 }
 
+/// 当前的日志级别（无论是否启用）。
+pub fn level() -> LogLevel {
+    current_level()
+}
+
 fn current_level() -> LogLevel {
     match LEVEL.load(Ordering::Relaxed) {
         0 => LogLevel::Error,

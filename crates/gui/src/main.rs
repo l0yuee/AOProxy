@@ -55,7 +55,7 @@ fn main() {
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();
 
-    // 先按系统语言，读到配置后再换成配置里的：加载出错时的提示也得有个语言。
+    // 先按系统语言，读到配置后再看用户有没有选过：加载出错时的提示也得有个语言。
     i18n::set_language(Language::detect());
 
     // 配置文件：命令行 `--config` > 设置页记下的位置 > 平台默认。
@@ -67,10 +67,9 @@ fn main() {
     };
     let cfg = load_config(&config_path);
 
-    // 语言跟着配置走：设置页里选了什么，下次启动就是什么，
-    // 否则下拉框里写着 English，界面却还是按系统语言显示的中文。
+    // 用户在设置页选过语言就用选的，没选过跟随系统。
     if let Ok(c) = &cfg {
-        i18n::set_language(c.app.language);
+        i18n::set_language(c.app.effective_language());
     }
 
     // 初始化日志（GUI 模式：写 stderr 同时写环形缓冲）
@@ -118,14 +117,11 @@ fn main() {
     std::process::exit(app.pin_mut().exec());
 }
 
-/// 读配置。文件还不存在算正常：从空配置起步，第一次改动时写盘；
-/// 界面语言此时跟随系统，并记进配置，设置页的下拉框才与界面一致。
+/// 读配置。文件还不存在算正常：从空配置起步（界面语言跟随系统），第一次改动时写盘。
 fn load_config(path: &std::path::Path) -> aoproxy_core::Result<Config> {
     match Config::load(path) {
         Err(Error::ConfigRead { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            let mut fresh = Config::default_empty();
-            fresh.app.language = Language::detect();
-            Ok(fresh)
+            Ok(Config::default_empty())
         }
         other => other,
     }

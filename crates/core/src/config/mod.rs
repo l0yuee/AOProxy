@@ -210,9 +210,12 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
-    /// 界面语言。
-    #[serde(default)]
-    pub language: Language,
+    /// 界面语言。不写（`None`）表示跟随系统语言，用户在设置页选过之后才记下来。
+    ///
+    /// 不能在第一次存盘时把当时推测出的系统语言一并写进去：那样它就成了「用户的选择」，
+    /// 系统语言再变也不跟了。实际使用的语言见 [`AppConfig::effective_language`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
 
     /// 日志是否开启。
     #[serde(default)]
@@ -230,11 +233,18 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            language: Language::default(),
+            language: None,
             logging_enabled: false,
             log_level: LogLevel::default(),
             minimize_to_tray: true,
         }
+    }
+}
+
+impl AppConfig {
+    /// 实际使用的界面语言：用户选过的优先，否则跟随系统（见 [`Language::detect`]）。
+    pub fn effective_language(&self) -> Language {
+        self.language.unwrap_or_else(Language::detect)
     }
 }
 
@@ -290,8 +300,9 @@ pub struct Rule {
     #[serde(default)]
     pub name: String,
 
-    /// 是否启用。
-    #[serde(default = "default_true")]
+    /// 是否启用：`aoproxy run`、「全部启用」与开机自启只启动启用的规则。
+    /// 配置里不写时视为未启用——没有被明确打开过的规则不该自己跑起来。
+    #[serde(default)]
     pub enabled: bool,
 
     /// 转发模式。
@@ -986,6 +997,39 @@ mod tests {
         assert_eq!(original.rules[0].listen, loaded.rules[0].listen);
         assert_eq!(original.rules[1].id,     loaded.rules[1].id);
         assert_eq!(original.version,         loaded.version);
+    }
+
+    // ── 默认值 ─────────────────────────────────────────────
+
+    /// 规则没写 `enabled` 时视为未启用。
+    #[test]
+    fn rule_enabled_defaults_to_false() {
+        let cfg: Config = toml::from_str(
+            "version = 1\n[[rules]]\nid = \"a\"\nmode = \"forward\"\nlisten = \"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        assert!(!cfg.rules[0].enabled);
+        assert!(cfg.enabled_rules().is_empty());
+    }
+
+    /// 没选过语言就不写 `language`，存盘也不会把推测出的系统语言固定下来；
+    /// 选过的原样读写。
+    #[test]
+    fn language_is_only_stored_once_chosen() {
+        let unset = AppConfig::default();
+        assert_eq!(unset.language, None);
+        let text = toml::to_string(&unset).unwrap();
+        assert!(!text.contains("language"), "{text}");
+        let back: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.language, None);
+
+        let chosen = AppConfig {
+            language: Some(Language::EnUs),
+            ..AppConfig::default()
+        };
+        let back: AppConfig = toml::from_str(&toml::to_string(&chosen).unwrap()).unwrap();
+        assert_eq!(back.language, Some(Language::EnUs));
+        assert_eq!(back.effective_language(), Language::EnUs);
     }
 
     // ── 配置文件位置 ────────────────────────────────────────
