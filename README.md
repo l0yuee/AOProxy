@@ -198,8 +198,8 @@ aoproxy run --listen 127.0.0.1:8080 --mode reverse --target https://api.anthropi
   并决定它会不会被「全部启用」与开机自启一并启动；卡片上的「启动」「停止」只管这一次，不改开关。
 - **日志**：运行日志。默认关闭，在设置页打开。
 - **设置**：
-  - 界面语言：默认跟随系统（中文系统用中文，其他一律英文），在这里选过之后以你的选择为准；
-    切换即时生效。日志开关与级别、关闭窗口时是否最小化到托盘。
+  - 界面语言：默认「跟随系统」（中文系统用中文，其他一律英文），在这里选了具体语言之后以你的选择为准，
+    选回「跟随系统」即恢复；切换即时生效。日志开关与级别、关闭窗口时是否最小化到托盘。
   - **登录系统后自动启动**：开机后程序缩在托盘里启动，并运行全部已启用的规则。登记在系统自己的自启位置：
     Windows 是注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 是
     `~/.config/autostart/aoproxy.desktop`，macOS 是 `~/Library/LaunchAgents/com.aoproxy.gui.plist`。
