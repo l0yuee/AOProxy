@@ -94,6 +94,9 @@ pub struct Engine {
     /// 串行化写盘。两次保存若交错进行，要么后落盘的是较旧的快照，
     /// 要么两边同时写同一个临时文件，把内容写花。
     persist_lock: Mutex<()>,
+    /// 开关改动连同实际启停一起排队，避免前一次停止尚未释放端口就再次启动。
+    /// 使用异步锁：等待监听任务退出时，后续开关操作让出运行时线程。
+    rule_toggle_lock: tokio::sync::Mutex<()>,
 }
 
 impl Engine {
@@ -120,6 +123,7 @@ impl Engine {
             states: Arc::new(RwLock::new(states)),
             config_path: RwLock::new(config_path),
             persist_lock: Mutex::new(()),
+            rule_toggle_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -428,15 +432,25 @@ impl Engine {
     }
 
     /// 切换规则的启用开关：置为启用则启动，置为停用则停止，两者都落盘。
+    /// 保存失败时保持原有开关与运行状态；启动失败则保留启用配置，并报告 Failed。
     pub async fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let _toggle = self.rule_toggle_lock.lock().await;
         {
+            // 写盘成功后才发布新开关。否则保存失败会直接返回，留下配置显示已停用、
+            // 监听却仍然运行（或者相反）的状态。与 persist/switch_config 使用同一把
+            // 锁，并在保存期间保留配置写锁，避免覆盖并发修改或写入错误的配置文件。
+            let _persist = self.persist_lock.lock();
             let mut cfg = self.config.write();
-            let rule = cfg
+            let mut draft = cfg.clone();
+            let rule = draft
                 .rule_mut(id)
                 .ok_or_else(|| Error::UnknownRule(id.to_owned()))?;
             rule.enabled = enabled;
+            if let Some(path) = self.config_path() {
+                draft.save(&path)?;
+            }
+            *cfg = draft;
         }
-        self.persist()?;
 
         if enabled {
             // 已在运行时 start_rule 会返回 AlreadyRunning，这不算切换失败。
@@ -598,6 +612,54 @@ mod tests {
         assert_eq!(e.running_count(), 0);
     }
 
+    /// 同一轮轮询中先关闭再开启：关闭会等待旧监听退出，后续开启必须等端口释放。
+    /// 若只依靠 generation，开启会撞上自己的旧监听，最终留下 enabled=true/Failed。
+    #[tokio::test]
+    async fn disabling_then_enabling_concurrently_keeps_latest_rule_running() {
+        let e = engine();
+        let r = rule("a", free_port());
+        let address = r.listen.clone();
+        e.upsert_rule(r).await.unwrap();
+        e.start_rule("a").await.unwrap();
+
+        let (disabled, enabled) = tokio::join!(
+            biased;
+            e.set_rule_enabled("a", false),
+            e.set_rule_enabled("a", true),
+        );
+        disabled.unwrap();
+        enabled.unwrap();
+        assert!(e.config().rule("a").unwrap().enabled);
+        assert_eq!(e.rule_status("a"), Some(RuleStatus::Running));
+        assert!(tokio::net::TcpStream::connect(&address).await.is_ok());
+
+        e.stop_all().await;
+        assert!(std::net::TcpListener::bind(&address).is_ok());
+    }
+
+    /// 外部程序占用端口仍然是可见的启动错误，释放后再次启用可以恢复。
+    #[tokio::test]
+    async fn enabling_rule_reports_bind_failure_and_can_retry() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let e = engine();
+        let mut r = rule("a", port);
+        r.enabled = false;
+        e.upsert_rule(r).await.unwrap();
+
+        assert!(matches!(
+            e.set_rule_enabled("a", true).await,
+            Err(Error::Bind { .. })
+        ));
+        assert!(e.config().rule("a").unwrap().enabled);
+        assert!(matches!(e.rule_status("a"), Some(RuleStatus::Failed(_))));
+
+        drop(occupied);
+        e.set_rule_enabled("a", true).await.unwrap();
+        assert_eq!(e.rule_status("a"), Some(RuleStatus::Running));
+        e.stop_all().await;
+    }
+
     #[tokio::test]
     async fn set_enabled_unknown_rule_reports_unknown() {
         let e = engine();
@@ -605,6 +667,64 @@ mod tests {
             e.set_rule_enabled("ghost", true).await,
             Err(Error::UnknownRule(_))
         ));
+    }
+
+    /// 把配置文件的父路径设为普通文件，可靠模拟写盘失败，不依赖平台权限语义。
+    fn unwritable_config_path() -> (PathBuf, PathBuf) {
+        let blocker = std::env::temp_dir().join(format!(
+            "aoproxy_enabled_save_failure_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("config.toml");
+        (blocker, path)
+    }
+
+    #[tokio::test]
+    async fn disabling_rule_when_save_fails_preserves_enabled_running_rule() {
+        let (blocker, path) = unwritable_config_path();
+        let r = rule("a", free_port());
+        let address = r.listen.clone();
+        let mut config = Config::default_empty();
+        config.rules.push(r);
+        let e = Engine::with_config_path(config, path);
+        e.start_rule("a").await.unwrap();
+
+        assert!(matches!(
+            e.set_rule_enabled("a", false).await,
+            Err(Error::ConfigWrite { .. })
+        ));
+        assert!(e.config().rule("a").unwrap().enabled);
+        assert_eq!(e.rule_status("a"), Some(RuleStatus::Running));
+        assert!(tokio::net::TcpStream::connect(&address).await.is_ok());
+
+        e.stop_all().await;
+        std::fs::remove_file(blocker).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabling_rule_when_save_fails_preserves_disabled_stopped_rule() {
+        let (blocker, path) = unwritable_config_path();
+        let mut r = rule("a", free_port());
+        r.enabled = false;
+        let address = r.listen.clone();
+        let mut config = Config::default_empty();
+        config.rules.push(r);
+        let e = Engine::with_config_path(config, path);
+
+        assert!(matches!(
+            e.set_rule_enabled("a", true).await,
+            Err(Error::ConfigWrite { .. })
+        ));
+        assert!(!e.config().rule("a").unwrap().enabled);
+        assert_eq!(e.rule_status("a"), Some(RuleStatus::Stopped));
+        assert!(std::net::TcpListener::bind(&address).is_ok());
+
+        std::fs::remove_file(blocker).unwrap();
     }
 
     // ── reload ─────────────────────────────────────────────

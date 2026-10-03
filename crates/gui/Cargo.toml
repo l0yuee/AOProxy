@@ -11,9 +11,9 @@ authors.workspace = true
 [[bin]]
 name = "aoproxy-gui"
 path = "src/main.rs"
-# 本 crate 只是 QML 与 core 之间的桥接层，逻辑与测试都在 aoproxy-core。
-# 关掉测试目标，否则 cargo test 会链出一个需要 Qt DLL 的空测试程序，
-# 在未部署 Qt 的 target/debug 下以 STATUS_DLL_NOT_FOUND 退出。
+# 主程序不生成空单元测试目标。GUI 设置恢复测试在 tests/recovery_settings.rs，
+# 托盘菜单另由 Qt Quick Test 覆盖；Windows 下运行测试需让 Qt DLL 可被找到，
+# 命令见 README 的「测试」一节。
 test = false
 
 [dependencies]

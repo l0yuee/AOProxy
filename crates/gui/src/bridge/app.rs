@@ -678,11 +678,12 @@ impl qobject::AppBridge {
     fn apply_app(mut self: Pin<&mut Self>, app: AppConfig) {
         let result = match shared::engine() {
             Some(engine) => engine.update_app_config(app),
-            // 配置没读出来，存不了盘；至少让语言与日志开关当场生效。
+            // 配置没读出来，存不了盘；完整设置保留在内存，关闭到托盘同样即时生效。
             None => {
                 i18n::set_language(app.effective_language());
                 aoproxy_core::log::set_logging_enabled(app.logging_enabled);
                 aoproxy_core::log::set_level(app.log_level);
+                shared::set_fallback_app(app);
                 Ok(())
             }
         };
@@ -707,18 +708,9 @@ impl qobject::AppBridge {
     }
 }
 
-/// 当前的应用设置。没有引擎（配置没读出来）时存不了盘，就取本进程正在用的语言与
-/// 日志设置：否则托盘里刚打开的日志一读回来又成了关、刚选的语言又被换回系统语言。
+/// 当前的应用设置。没有引擎时读取完整的内存副本；引擎恢复后自动改读其配置。
 fn current_app() -> AppConfig {
-    shared::engine().map_or_else(
-        || AppConfig {
-            language: Some(i18n::language()),
-            logging_enabled: aoproxy_core::log::logging_enabled(),
-            log_level: aoproxy_core::log::level(),
-            ..Default::default()
-        },
-        |engine| engine.config().app,
-    )
+    shared::current_config().app
 }
 
 /// 换配置文件前的准备：文件已存在就读出来，不存在就把当前配置存过去（换个地方放）。
@@ -727,7 +719,7 @@ fn prepare_config(path: &Path) -> aoproxy_core::Result<Config> {
     if path.exists() {
         return Config::load(path);
     }
-    let current = shared::engine().map_or_else(Config::default_empty, |e| e.config());
+    let current = shared::current_config();
     current.save(path)?;
     Ok(current)
 }

@@ -366,6 +366,33 @@ export ANTHROPIC_CUSTOM_HEADERS='Proxy-Authorization: Basic YWxpY2U6czNjcmV0'   
 
 ---
 
+## 测试
+
+核心引擎、配置与命令行回归测试：
+
+```bash
+cargo test -p aoproxy-core -p aoproxy
+```
+
+Windows 下可用项目自带的 Qt 6.8.3 运行托盘菜单回归测试（需要 MSVC 生成工具）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/test-qml.ps1
+```
+
+配置损坏后的 GUI 设置恢复另有 Rust 回归测试。在 Windows 下运行时将 Qt DLL 目录加入当前进程的 PATH：
+
+```powershell
+$env:PATH = (Resolve-Path third_party/qt/bin).Path + ';' + $env:PATH
+cargo test -p aoproxy-gui --test recovery_settings
+```
+
+托盘测试在离屏模式运行真实的 QML 菜单，覆盖启用开关、失败回滚、外部状态同步、配置切换与语言切换。
+其他平台可在单独的构建目录用系统 Qt 的 `qmake` 构建 `crates/gui/tests/qml_tests.pro`，
+再以 `-platform offscreen -input <项目路径>/crates/gui/tests` 运行生成的测试程序。
+
+---
+
 ## 许可证
 
 MIT。`third_party/qt` 下随附的 Qt 按其自身许可证（LGPL-3.0 等）分发，详见

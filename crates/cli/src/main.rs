@@ -73,31 +73,36 @@ struct RunArgs {
     listen: Option<String>,
 
     /// 临时规则的转发模式 [forward|reverse]
-    #[arg(long, value_name = "MODE", default_value = "forward")]
+    #[arg(
+        long,
+        value_name = "MODE",
+        default_value = "forward",
+        requires = "listen"
+    )]
     mode: String,
 
     /// 临时规则的目标地址（reverse 模式必填），如 https://api.anthropic.com
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", requires = "listen")]
     target: Option<String>,
 
     /// 临时规则的入站 Basic 认证，格式 用户名:密码
-    #[arg(long, value_name = "USER:PASS")]
+    #[arg(long, value_name = "USER:PASS", requires = "listen")]
     auth: Option<String>,
 
     /// 临时规则的入站认证路径令牌（仅 reverse 模式）
-    #[arg(long, value_name = "TOKEN")]
+    #[arg(long, value_name = "TOKEN", requires = "listen")]
     auth_token: Option<String>,
 
     /// 临时规则的入站 TLS 证书链文件（PEM）
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", requires = "listen")]
     tls_cert: Option<PathBuf>,
 
     /// 临时规则的入站 TLS 私钥文件（PEM）
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", requires = "listen")]
     tls_key: Option<PathBuf>,
 
     /// 临时规则的出站上游，如 socks5://user:pass@host:1080
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", requires = "listen")]
     upstream: Option<String>,
 }
 
@@ -524,6 +529,48 @@ fn parse_log_level(s: &str) -> LogLevel {
 mod tests {
     use super::*;
     use aoproxy_core::UpstreamKind;
+
+    /// 临时规则选项不能在漏写 --listen 时被忽略，尤其是认证与 TLS 参数。
+    #[test]
+    fn ad_hoc_options_require_listen() {
+        for prefix in [vec!["aoproxy"], vec!["aoproxy", "run"]] {
+            for (option, value) in [
+                ("--mode", "forward"),
+                ("--target", "https://example.com"),
+                ("--auth", "user:password"),
+                ("--auth-token", "secret"),
+                ("--tls-cert", "cert.pem"),
+                ("--tls-key", "key.pem"),
+                ("--upstream", "socks5://127.0.0.1:1080"),
+            ] {
+                let mut argv = prefix.clone();
+                argv.extend([option, value]);
+                let error = match Cli::try_parse_from(&argv) {
+                    Err(error) => error,
+                    Ok(_) => panic!("{argv:?} must require --listen"),
+                };
+                assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+                assert!(error.to_string().contains("--listen"));
+
+                argv.extend(["--listen", "127.0.0.1:8080"]);
+                assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
+            }
+        }
+    }
+
+    /// 默认 mode 不应要求 --listen；正常的配置文件调用继续生效。
+    #[test]
+    fn config_run_does_not_require_listen() {
+        for argv in [
+            vec!["aoproxy"],
+            vec!["aoproxy", "run"],
+            vec!["aoproxy", "-c", "config.toml", "--rule", "claude"],
+            vec!["aoproxy", "run", "-c", "config.toml", "--quiet"],
+            vec!["aoproxy", "config", "check", "-c", "config.toml"],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
+        }
+    }
 
     // ── parse_upstream_url ─────────────────────────────────
 

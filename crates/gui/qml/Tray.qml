@@ -88,8 +88,7 @@ SystemTrayIcon {
                  : "qrc:/qt/qml/AOProxy/qml/icons/tray-idle.ico"
 
     tooltip: runningCount > 0
-             ? (bridge ? bridge.trFmt("gui.tray_tip_running",
-                                      JSON.stringify({ count: runningCount })) : "")
+             ? root.tf("gui.tray_tip_running", { count: runningCount })
              : t("gui.tray_tip_idle")
 
     Component.onCompleted: {

@@ -6,16 +6,20 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
 
 use aoproxy_core::log::LogBuffer;
-use aoproxy_core::Engine;
+use aoproxy_core::{AppConfig, Config, Engine};
 
 /// 引擎。配置加载失败时为 `None`，之后在设置页换上一个能读的配置文件时才建起来，
 /// 所以不能像其余几项那样只设一次：桥接对象每次用都来这里取，别自己存一份。
 static ENGINE: RwLock<Option<Arc<Engine>>> = RwLock::new(None);
+/// 配置损坏、还没有引擎时的完整应用设置。此时仍允许改语言、日志与关闭到托盘，
+/// 不能只靠各子系统的当前值重建，否则托盘选项与「跟随系统」的选择会丢失。
+static FALLBACK_APP: LazyLock<RwLock<AppConfig>> =
+    LazyLock::new(|| RwLock::new(AppConfig::default()));
 static LOG_BUFFER: OnceLock<Arc<LogBuffer>> = OnceLock::new();
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
 /// 日志到达通知，等 `LogModel` 构造好后被它取走。
@@ -50,6 +54,13 @@ pub fn init(
     if LAUNCH.set(launch).is_err() {
         return;
     }
+    // main 已初始化日志。配置加载失败时为便于排错会临时打开日志，保留这一初值；
+    // 语言仍是 None（跟随系统），不要把当前推测出的语言记成用户的显式选择。
+    set_fallback_app(AppConfig {
+        logging_enabled: aoproxy_core::log::logging_enabled(),
+        log_level: aoproxy_core::log::level(),
+        ..Default::default()
+    });
     *ENGINE.write() = engine;
     let _ = LOG_BUFFER.set(buffer);
     *LOG_RX.lock() = Some(log_rx);
@@ -75,6 +86,24 @@ pub fn engine() -> Option<Arc<Engine>> {
 /// 装上引擎。只在启动时没有引擎、后来换上了能读的配置文件时用到。
 pub fn set_engine(engine: Arc<Engine>) {
     *ENGINE.write() = Some(engine);
+}
+
+/// 当前完整配置。引擎恢复后以它为准；恢复前保留用户在设置页做的改动，
+/// 也供「换用一个不存在的配置文件」把这些设置连同空规则列表一起保存。
+pub fn current_config() -> Config {
+    engine().map_or_else(
+        || {
+            let mut config = Config::default_empty();
+            config.app = FALLBACK_APP.read().clone();
+            config
+        },
+        |engine| engine.config(),
+    )
+}
+
+/// 只用于还没有引擎时的设置更新。装上引擎后 `current_config` 不再读它。
+pub fn set_fallback_app(app: AppConfig) {
+    *FALLBACK_APP.write() = app;
 }
 
 /// 共享的日志环形缓冲。
